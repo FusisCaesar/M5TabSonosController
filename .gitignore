@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+*.pyc
+__pycache__/
+*.log
+favlog*.txt
