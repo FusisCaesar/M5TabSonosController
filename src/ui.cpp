@@ -330,123 +330,215 @@ const char* kindName(svc::Kind kind) {
     if (kind == svc::Kind::Album) return "Album";
     if (kind == svc::Kind::Playlist) return "Playlist";
     if (kind == svc::Kind::Artist) return "Artist";
+    if (kind == svc::Kind::Radio) return "Radio";
     return "Song";
 }
 
-constexpr int KEY_Y = 392;
+bool canQueue(svc::Kind kind) {
+    return kind == svc::Kind::Track || kind == svc::Kind::Album || kind == svc::Kind::Playlist;
+}
+
+void drawMark(M5Canvas& c, int x, int y, int w, int h, bool play, bool hot) {
+    c.fillRoundRect(x, y, w, h, 12, hot ? COL_ACCENT : COL_CARD2);
+    uint16_t ink = hot ? COL_BG : COL_TEXT;
+    c.setTextDatum(MC_DATUM);
+    c.setTextColor(ink);
+    if (play) {
+        int cx = x + w / 2 + 2;
+        int cy = y + h / 2;
+        int s = h / 5;
+        if (s < 8) s = 8;
+        c.fillTriangle(cx - s, cy - s, cx - s, cy + s, cx + s + 2, cy, ink);
+    } else {
+        c.setFont(&fontBrowse);
+        c.drawString("+", x + w / 2, y + h / 2);
+    }
+    c.setTextDatum(TL_DATUM);
+}
+
+constexpr int BR_X = 16;
+constexpr int BR_W = 1248;
+constexpr int BR_TOP = 116;
+constexpr int BR_SAFE = 580;
+constexpr int BR_BTN_H = 52;
+constexpr int BR_SEARCH_Y = BR_TOP + BR_BTN_H + 12;
+constexpr int BR_SEARCH_H = 84;
+constexpr int BR_LIST = BR_SEARCH_Y + BR_SEARCH_H + 16;
+constexpr int BR_H = 118;
+constexpr int BR_CLEAR = 72;
+constexpr int KEY_H = 64;
+constexpr int KEY_ROW = 72;
+constexpr int KEY_Y = BR_SAFE - 4 * KEY_ROW;
+
+int clearX() { return BR_X + BR_W - 16 - BR_CLEAR; }
+int clearY() { return BR_SEARCH_Y + (BR_SEARCH_H - BR_CLEAR) / 2; }
+bool clearHit(int x, int y) {
+    return x >= clearX() && x < clearX() + BR_CLEAR && y >= clearY() && y < clearY() + BR_CLEAR;
+}
+
+int browseListTop() {
+    if (!keyboard && browse.status[0] && browse.count > 0) return BR_LIST + 56;
+    return BR_LIST;
+}
 
 char keyAt(int x, int y) {
-    if (!keyboard || y < KEY_Y || y >= FAV_B) return 0;
+    if (!keyboard || x < BR_X || x >= BR_X + BR_W || y < KEY_Y || y >= BR_SAFE) return 0;
     const char* rows[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
     for (int row = 0; row < 3; row++) {
         int cols = (int)strlen(rows[row]) + (row == 2 ? 1 : 0);
-        int gap = 8;
-        int w = (FAV_W - (cols - 1) * gap) / cols;
+        int gap = 10;
+        int w = (BR_W - (cols - 1) * gap) / cols;
         for (int col = 0; col < (int)strlen(rows[row]); col++) {
-            int bx = FAV_X + col * (w + gap);
-            int by = KEY_Y + row * 56;
-            if (x >= bx && y >= by && x < bx + w && y < by + 48) return rows[row][col];
+            int bx = BR_X + col * (w + gap);
+            int by = KEY_Y + row * KEY_ROW;
+            if (x >= bx && y >= by && x < bx + w && y < by + KEY_H) return rows[row][col];
         }
         if (row == 2) {
             int col = (int)strlen(rows[row]);
-            int bx = FAV_X + col * (w + gap);
-            int by = KEY_Y + row * 56;
-            if (x >= bx && y >= by && x < bx + w && y < by + 48) return '\b';
+            int bx = BR_X + col * (w + gap);
+            int by = KEY_Y + row * KEY_ROW;
+            if (x >= bx && y >= by && x < bx + w && y < by + KEY_H) return '\b';
         }
     }
-    int by = KEY_Y + 168;
-    if (y >= by && y < by + 48) {
-        if (x >= FAV_X && x < FAV_X + 520) return ' ';
-        if (x >= FAV_X + 536 && x < FAV_X + FAV_W) return '\n';
+    int by = KEY_Y + 3 * KEY_ROW;
+    if (y >= by && y < by + KEY_H) {
+        if (x < BR_X + 860) return ' ';
+        return '\n';
     }
     return 0;
 }
 
 void drawKey(M5Canvas& c, int x, int y, int w, const char* label, bool accent) {
-    c.fillRoundRect(x, y, w, 48, 10, accent ? COL_ACCENT : COL_CARD2);
-    c.setFont(&fontBody);
+    c.fillRoundRect(x, y, w, KEY_H, 12, accent ? COL_ACCENT : COL_CARD2);
+    c.setFont(&fontBrowse);
     c.setTextColor(accent ? COL_BG : COL_TEXT);
     c.setTextDatum(MC_DATUM);
-    c.drawString(label, x + w / 2, y + 24);
+    c.drawString(label, x + w / 2, y + KEY_H / 2);
     c.setTextDatum(TL_DATUM);
 }
 
 void drawKeyboard(M5Canvas& c) {
+    c.setClipRect(0, KEY_Y, c.width(), BR_SAFE - KEY_Y);
     const char* rows[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
     for (int row = 0; row < 3; row++) {
         int cols = (int)strlen(rows[row]) + (row == 2 ? 1 : 0);
-        int gap = 8;
-        int w = (FAV_W - (cols - 1) * gap) / cols;
+        int gap = 10;
+        int w = (BR_W - (cols - 1) * gap) / cols;
         for (int col = 0; col < (int)strlen(rows[row]); col++) {
             char label[2] = {rows[row][col], 0};
-            drawKey(c, FAV_X + col * (w + gap), KEY_Y + row * 56, w, label, false);
+            drawKey(c, BR_X + col * (w + gap), KEY_Y + row * KEY_ROW, w, label, false);
         }
         if (row == 2) {
             int col = (int)strlen(rows[row]);
-            drawKey(c, FAV_X + col * (w + gap), KEY_Y + row * 56, w, "del", false);
+            drawKey(c, BR_X + col * (w + gap), KEY_Y + row * KEY_ROW, w, "del", false);
         }
     }
-    drawKey(c, FAV_X, KEY_Y + 168, 512, "space", false);
-    drawKey(c, FAV_X + 536, KEY_Y + 168, FAV_W - 536, "Search", true);
+    int by = KEY_Y + 3 * KEY_ROW;
+    drawKey(c, BR_X, by, 844, "space", false);
+    drawKey(c, BR_X + 860, by, BR_W - 860, "Search", true);
+    c.clearClipRect();
 }
 
 void drawBrowse(M5Canvas& c) {
-    c.setFont(&fontUi);
-    text(c, svc::providerName(), FAV_X, FAV_Y, 180, COL_ACCENT);
-    bool lists = pressing && !moved && x0 >= FAV_X + 200 && x0 < FAV_X + 420 && y0 >= FAV_Y && y0 < FAV_Y + 44;
-    c.fillRoundRect(FAV_X + 200, FAV_Y, 210, 44, 10, lists ? COL_ACCENT : COL_CARD);
-    c.setTextDatum(MC_DATUM);
-    c.setTextColor(lists ? COL_BG : COL_TEXT);
-    c.drawString("My playlists", FAV_X + 305, FAV_Y + 22);
-    c.setTextDatum(TL_DATUM);
-
-    int listTop = FAV_Y + 100;
-    int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
-    c.fillRoundRect(FAV_X, FAV_Y + 52, FAV_W, 40, 10, COL_CARD2);
-    c.setFont(&fontBody);
-    text(c, query[0] ? query : "Search Spotify", FAV_X + 16, FAV_Y + 58, FAV_W - 32, query[0] ? COL_TEXT : COL_MUTED);
-
-    if (browse.status[0]) text(c, browse.status, FAV_X, listTop, FAV_W, COL_MUTED);
-    int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
-    int viewH = listBottom - listTop;
-    int maxS = listMax(rows, viewH, FAV_H);
-    if (browseScroll > maxS) browseScroll = maxS;
-    if (browseScroll < 0) browseScroll = 0;
-    c.setClipRect(FAV_X, listTop, FAV_W, viewH);
-    if (browse.loading && browse.count == 0) {
-        text(c, "Loading Spotify...", FAV_X, listTop + 8, FAV_W, COL_MUTED);
-    }
-    for (int i = 0; i < browse.count; i++) {
-        int y = listTop + i * FAV_H - browseScroll;
-        if (y + FAV_H < listTop || y > listBottom) continue;
-        c.fillRoundRect(FAV_X, y + 4, FAV_W - 72, FAV_H - 8, 12, COL_CARD);
-        c.setFont(&fontBody);
-        char line[100];
-        snprintf(line, sizeof(line), "%s", browse.items[i].title);
-        text(c, line, FAV_X + 16, y + 10, FAV_W - 100, COL_TEXT);
-        snprintf(line, sizeof(line), "%s%s%s", kindName(browse.items[i].kind), browse.items[i].subtitle[0] ? "  " : "",
-                 browse.items[i].subtitle);
-        c.setFont(&fontBody);
-        text(c, line, FAV_X + 16, y + 40, FAV_W - 100, COL_MUTED);
-        bool hot = pressing && !moved && x0 >= FAV_X + FAV_W - 64 && x0 < FAV_X + FAV_W && y0 >= y + 14 && y0 < y + 62;
-        c.fillRoundRect(FAV_X + FAV_W - 60, y + 16, 48, 44, 10, hot ? COL_ACCENT : COL_CARD2);
+    c.fillRect(0, 109, c.width(), BR_SAFE - 109, COL_BG);
+    c.setFont(&fontBrowse);
+    bool queuePage = browse.pagePlayable && canQueue(browse.pageKind);
+    int playX = BR_X + BR_W - 16 - 64;
+    if (queuePage) playX -= 76;
+    if (browse.canBack) {
+        bool hot = pressing && !moved && x0 >= BR_X && x0 < BR_X + 160 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+        c.fillRoundRect(BR_X, BR_TOP, 160, BR_BTN_H, 12, hot ? COL_ACCENT : COL_CARD);
         c.setTextDatum(MC_DATUM);
         c.setTextColor(hot ? COL_BG : COL_TEXT);
-        c.setFont(&fontUi);
-        c.drawString("+", FAV_X + FAV_W - 36, y + 38);
+        c.drawString("Back", BR_X + 80, BR_TOP + BR_BTN_H / 2);
+        c.setTextDatum(TL_DATUM);
+        int titleW = (browse.pagePlayable ? playX : BR_X + BR_W) - (BR_X + 176) - 12;
+        if (titleW < 40) titleW = 40;
+        text(c, browse.heading[0] ? browse.heading : "Spotify", BR_X + 176, BR_TOP, titleW, COL_TEXT);
+    } else {
+        text(c, svc::providerName(), BR_X, BR_TOP + 4, 220, COL_ACCENT);
+        bool lists = pressing && !moved && x0 >= BR_X + 240 && x0 < BR_X + 580 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+        c.fillRoundRect(BR_X + 240, BR_TOP, 340, BR_BTN_H, 12, lists ? COL_ACCENT : COL_CARD);
+        c.setTextDatum(MC_DATUM);
+        c.setTextColor(lists ? COL_BG : COL_TEXT);
+        c.drawString("My playlists", BR_X + 410, BR_TOP + BR_BTN_H / 2);
         c.setTextDatum(TL_DATUM);
     }
+    if (browse.pagePlayable) {
+        bool hot = pressing && !moved && x0 >= playX && x0 < playX + 64 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+        drawMark(c, playX, BR_TOP, 64, BR_BTN_H, true, hot);
+        if (queuePage) {
+            int plusX = playX + 76;
+            bool plusHot = pressing && !moved && x0 >= plusX && x0 < plusX + 64 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+            drawMark(c, plusX, BR_TOP, 64, BR_BTN_H, false, plusHot);
+        }
+    }
+
+    c.fillRoundRect(BR_X, BR_SEARCH_Y, BR_W, BR_SEARCH_H, 14, COL_CARD2);
+    c.setFont(&fontTitle);
+    c.setTextColor(query[0] ? COL_TEXT : COL_MUTED);
+    int textY = BR_SEARCH_Y + (BR_SEARCH_H - c.fontHeight()) / 2;
+    c.setClipRect(BR_X + 24, BR_SEARCH_Y + 4, clearX() - BR_X - 48, BR_SEARCH_H - 8);
+    c.drawString(query[0] ? query : "Search Spotify", BR_X + 24, textY);
+    c.clearClipRect();
+    bool clearing = pressing && !moved && clearHit(x0, y0);
+    c.fillRoundRect(clearX(), clearY(), BR_CLEAR, BR_CLEAR, 12, clearing ? COL_ACCENT : COL_CARD);
+    c.setTextDatum(MC_DATUM);
+    c.setTextColor(clearing ? COL_BG : COL_TEXT);
+    c.drawString("x", clearX() + BR_CLEAR / 2, clearY() + BR_CLEAR / 2);
+    c.setTextDatum(TL_DATUM);
+
+    if (keyboard) {
+        drawKeyboard(c);
+        return;
+    }
+
+    int listTop = browseListTop();
+    int listBottom = BR_SAFE;
+    c.setFont(&fontBrowse);
+    if (browse.status[0]) text(c, browse.status, BR_X, BR_LIST, BR_W, COL_MUTED);
+    int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
+    int viewH = listBottom - listTop;
+    int maxS = listMax(rows, viewH, BR_H);
+    if (browseScroll > maxS) browseScroll = maxS;
+    if (browseScroll < 0) browseScroll = 0;
+    c.setClipRect(BR_X, listTop, BR_W, viewH);
+    if (browse.loading && browse.count == 0) {
+        text(c, "Loading Spotify...", BR_X, listTop + 8, BR_W, COL_MUTED);
+    }
+    for (int i = 0; i < browse.count; i++) {
+        int y = listTop + i * BR_H - browseScroll;
+        if (y + BR_H < listTop || y > listBottom) continue;
+        bool queued = canQueue(browse.items[i].kind);
+        int gutter = queued ? 176 : 96;
+        c.fillRoundRect(BR_X, y + 4, BR_W - gutter, BR_H - 8, 14, COL_CARD);
+        c.setFont(&fontBrowse);
+        text(c, browse.items[i].title, BR_X + 20, y + 8, BR_W - gutter - 36, COL_TEXT);
+        char line[100];
+        snprintf(line, sizeof(line), "%s%s%s", kindName(browse.items[i].kind), browse.items[i].subtitle[0] ? "  " : "",
+                 browse.items[i].subtitle);
+        c.setFont(&fontBrowseBody);
+        text(c, line, BR_X + 20, y + 62, BR_W - gutter - 36, COL_MUTED);
+        int plusX = BR_X + BR_W - 80;
+        int markX = queued ? plusX - 80 : plusX;
+        bool playHot = pressing && !moved && x0 >= markX && x0 < markX + 68 && y0 >= y + 24 && y0 < y + 94;
+        drawMark(c, markX, y + 26, 68, 66, true, playHot);
+        if (queued) {
+            bool plusHot = pressing && !moved && x0 >= plusX && x0 < plusX + 68 && y0 >= y + 24 && y0 < y + 94;
+            drawMark(c, plusX, y + 26, 68, 66, false, plusHot);
+        }
+    }
     if (browse.more || browse.offset > 0) {
-        int y = listTop + browse.count * FAV_H - browseScroll;
-        if (y + FAV_H >= listTop && y <= listBottom) {
-            c.setFont(&fontBody);
+        int y = listTop + browse.count * BR_H - browseScroll;
+        if (y + BR_H >= listTop && y <= listBottom) {
+            c.setFont(&fontBrowse);
             char page[40];
-            snprintf(page, sizeof(page), "%s%s", browse.offset > 0 ? "Back" : "", browse.more ? (browse.offset > 0 ? "    More" : "More") : "");
-            text(c, page, FAV_X + 16, y + 18, FAV_W, COL_ACCENT);
+            snprintf(page, sizeof(page), "%s%s", browse.offset > 0 ? "Previous" : "",
+                     browse.more ? (browse.offset > 0 ? "    More" : "More") : "");
+            text(c, page, BR_X + 20, y + 32, BR_W, COL_ACCENT);
         }
     }
     c.clearClipRect();
-    if (keyboard) drawKeyboard(c);
 }
 
 void drawMain(M5Canvas& c) {
@@ -474,10 +566,18 @@ void drawMain(M5Canvas& c) {
     headerButton(FAV, "Favorites", panel == Panel::Favs);
 
     c.drawFastHLine(0, 108, c.width(), COL_LINE);
-    c.drawFastVLine(380, 108, c.height() - 108, COL_LINE);
-    c.drawFastHLine(380, PLAY.y - 8, c.width() - 380, COL_LINE);
+    if (panel != Panel::Browse) {
+        c.drawFastVLine(380, 108, c.height() - 108, COL_LINE);
+        c.drawFastHLine(380, PLAY.y - 8, c.width() - 380, COL_LINE);
+    } else {
+        c.drawFastHLine(0, PLAY.y - 8, c.width(), COL_LINE);
+    }
 
     int roomsH = LIST_B - LIST_Y;
+    if (panel == Panel::Browse) {
+        drawBrowse(c);
+        goto controls;
+    }
     c.setClipRect(LIST_X, LIST_Y, LIST_W, roomsH);
     for (int i = 0; i < view.roomCount;) {
         int n = groupRun(i);
@@ -607,8 +707,6 @@ void drawMain(M5Canvas& c) {
                 if (fill > 0) c.fillRoundRect(tx, y, fill, 10, 5, COL_ACCENT);
             }
         }
-    } else if (panel == Panel::Browse) {
-        drawBrowse(c);
     } else {
         c.setFont(&fontUi);
         const char* heading = "Sonos favorites";
@@ -669,6 +767,7 @@ void drawMain(M5Canvas& c) {
         c.clearClipRect();
     }
 
+controls:
     auto button = [&](const Box& b, char kind, bool accent) {
         bool hot = pressing && !moved && b.contains(x0, y0);
         uint16_t bg = accent ? COL_ACCENT : COL_CARD;
@@ -723,11 +822,11 @@ void onTap(int x, int y) {
         else {
             panel = next;
             favScroll = 0;
-            browseScroll = 0;
+            if (next != Panel::Browse) browseScroll = 0;
             keyboard = false;
             if (next == Panel::Queue) sonos::command(sonos::Cmd::LoadQueue, 0, nullptr);
             else if (next == Panel::Favs) sonos::command(sonos::Cmd::LoadFavorites, 0, nullptr);
-            else svc::requestPlaylists(0);
+            else if (!browse.canBack && browse.count == 0) svc::requestPlaylists(0);
         }
         return;
     }
@@ -743,7 +842,7 @@ void onTap(int x, int y) {
         sonos::command(sonos::Cmd::Next, 0, nullptr);
         return;
     }
-    if (x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
+    if (panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
         int idx = -1;
         if (roomActionAt(x, y, &idx)) {
             sonos::command(roomAction(idx) == RoomAction::Add ? sonos::Cmd::JoinRoom : sonos::Cmd::LeaveRoom,
@@ -754,7 +853,7 @@ void onTap(int x, int y) {
         if (idx >= 0) sonos::command(sonos::Cmd::ToggleRoom, 0, view.rooms[idx].uuid);
         return;
     }
-    if (panel == Panel::Browse && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_Y && y < FAV_B) {
+    if (panel == Panel::Browse && x >= BR_X && x < BR_X + BR_W && y >= BR_TOP && y < BR_SAFE) {
         char key = keyAt(x, y);
         if (key == '\b') {
             size_t n = strlen(query);
@@ -778,34 +877,70 @@ void onTap(int x, int y) {
             return;
         }
         if (key) return;
-        if (x >= FAV_X + 200 && x < FAV_X + 420 && y >= FAV_Y && y < FAV_Y + 44) {
+        if (clearHit(x, y)) {
+            query[0] = 0;
+            return;
+        }
+        if (browse.canBack && x >= BR_X && x < BR_X + 160 && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
+            keyboard = false;
+            browseScroll = 0;
+            svc::requestBack();
+            return;
+        }
+        if (!browse.canBack && x >= BR_X + 240 && x < BR_X + 580 && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
             query[0] = 0;
             keyboard = false;
             browseScroll = 0;
             svc::requestPlaylists(0);
             return;
         }
-        if (y >= FAV_Y + 52 && y < FAV_Y + 92) {
+        if (browse.pagePlayable && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
+            bool queuePage = canQueue(browse.pageKind);
+            int playX = BR_X + BR_W - 16 - 64;
+            if (queuePage) playX -= 76;
+            if (x >= playX && x < playX + 64) {
+                svc::requestPagePlay(false);
+                panel = Panel::Closed;
+                return;
+            }
+            if (queuePage && x >= playX + 76 && x < playX + 140) {
+                svc::requestPagePlay(true);
+                return;
+            }
+        }
+        if (y >= BR_SEARCH_Y && y < BR_SEARCH_Y + BR_SEARCH_H) {
             keyboard = !keyboard;
             return;
         }
-        int listTop = FAV_Y + 100;
-        int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
+        if (keyboard) return;
+        int listTop = browseListTop();
+        int listBottom = BR_SAFE;
         if (y >= listTop && y < listBottom && !browse.loading) {
-            int idx = (y - listTop + browseScroll) / FAV_H;
+            int idx = (y - listTop + browseScroll) / BR_H;
             if (idx == browse.count && (browse.more || browse.offset > 0)) {
-                bool back = x < FAV_X + FAV_W / 2 && browse.offset > 0;
-                int next = browse.offset + (back ? -10 : 10);
+                bool back = x < BR_X + BR_W / 2 && browse.offset > 0;
+                int step = browse.pageSize > 0 ? browse.pageSize : 10;
+                int next = browse.offset + (back ? -step : step);
                 if (next < 0) next = 0;
                 browseScroll = 0;
-                if (query[0]) svc::requestSearch(query, next);
-                else svc::requestPlaylists(next);
+                svc::requestPage(next);
                 return;
             }
             if (idx >= 0 && idx < browse.count) {
-                bool plus = x >= FAV_X + FAV_W - 64;
-                svc::requestPlay(idx, plus);
-                if (!plus && browse.items[idx].kind != svc::Kind::Artist) panel = Panel::Closed;
+                bool queued = canQueue(browse.items[idx].kind);
+                int plusX = BR_X + BR_W - 84;
+                int playX = queued ? plusX - 80 : plusX;
+                if (queued && x >= plusX) {
+                    svc::requestPlay(idx, true);
+                    return;
+                }
+                if (x >= playX || browse.items[idx].kind == svc::Kind::Radio) {
+                    svc::requestPlay(idx, false);
+                    panel = Panel::Closed;
+                    return;
+                }
+                browseScroll = 0;
+                svc::requestOpen(idx);
             }
         }
         return;
@@ -835,7 +970,7 @@ void beginGesture(int x, int y) {
         drag = Drag::None;
         return;
     }
-    if (panel == Panel::Browse && x >= FAV_X && y >= FAV_Y + 100 && y < (keyboard ? KEY_Y : FAV_B)) {
+    if (panel == Panel::Browse && !keyboard && x >= BR_X && x < BR_X + BR_W && y >= browseListTop() && y < BR_SAFE) {
         drag = Drag::Favs;
         scroll0 = browseScroll;
         return;
@@ -845,7 +980,7 @@ void beginGesture(int x, int y) {
         scroll0 = favScroll;
         return;
     }
-    if (x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
+    if (panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
         int idx = -1;
         if (roomActionAt(x, y, &idx)) {
             drag = Drag::None;
@@ -874,10 +1009,10 @@ void moveGesture(int x, int y) {
         if (roomScroll > maxS) roomScroll = maxS;
     } else if (drag == Drag::Favs) {
         if (panel == Panel::Browse) {
-            int listTop = FAV_Y + 100;
-            int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
+            int listTop = browseListTop();
+            int listBottom = BR_SAFE;
             int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
-            int maxS = listMax(rows, listBottom - listTop, FAV_H);
+            int maxS = listMax(rows, listBottom - listTop, BR_H);
             browseScroll = scroll0 - (y - y0);
             if (browseScroll < 0) browseScroll = 0;
             if (browseScroll > maxS) browseScroll = maxS;

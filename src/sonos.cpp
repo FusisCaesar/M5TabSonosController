@@ -2188,6 +2188,31 @@ bool enqueue(const char* uri, const char* meta, bool playNow) {
         setStatus("No room selected");
         return false;
     }
+    // Artist radio is a station. It starts on its own, the way TuneIn does.
+    if (uri && (strstr(uri, "x-sonosapi-radio") || strstr(uri, "artistRadio"))) {
+        if (!playNow) {
+            setStatus("A station plays on its own");
+            return true;
+        }
+        bool opened = setUri(c->ip, uri, meta ? meta : "");
+        bool started = false;
+        if (opened) {
+            for (int attempt = 0; attempt < 3 && !started; attempt++) {
+                if (attempt) delay(200);
+                started = avt(c->ip, "Play");
+            }
+        }
+        Serial.printf("[sonos] radio opened %d started %d\n", opened, started);
+        if (!started) {
+            setStatus(lastErr[0] ? lastErr : "Could not start that station");
+            return false;
+        }
+        lock();
+        published.playing = true;
+        unlock();
+        lastPoll = 0;
+        return true;
+    }
     return queueAndPlay(c, uri, meta, playNow);
 }
 
