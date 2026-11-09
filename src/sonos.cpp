@@ -2241,6 +2241,11 @@ bool playDirect(const char* uri, const char* title) {
         setStatus("Out of memory");
         return false;
     }
+    // The relay sends a plain AAC stream with no length, which the speaker takes as a radio station.
+    char radio[240];
+    if (strncmp(uri, "http://", 7) == 0) snprintf(radio, sizeof(radio), "x-rincon-mp3radio://%s", uri + 7);
+    else strlcpy(radio, uri, sizeof(radio));
+    uri = radio;
     Xml d;
     d.reset(meta, 16 * 1024);
     d.s("<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
@@ -2248,8 +2253,8 @@ bool playDirect(const char* uri, const char* title) {
         "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
         "<item id=\"yt\" parentID=\"-1\" restricted=\"true\"><dc:title>");
     d.xml(title && title[0] ? title : "YouTube");
-    d.s("</dc:title><upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-        "<res protocolInfo=\"http-get:*:audio/mp4:*\">");
+    d.s("</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+        "<res protocolInfo=\"x-rincon-mp3radio:*:*:*\">");
     d.xml(uri);
     d.s("</res></item></DIDL-Lite>");
     const char* use = d.overflow ? "" : meta;

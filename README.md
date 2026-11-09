@@ -109,7 +109,7 @@ Spotify app rules apply. An app in development mode is limited to a small list o
 YouTube has no official way to play its audio on a Sonos speaker, and the speaker cannot play a YouTube address by itself. This project does it like this:
 
 1. When you tap a result, the Tab5 asks YouTube's internal player endpoint (InnerTube) for the video's address, pretending to be a mobile YouTube app.
-2. YouTube refuses to serve the speaker directly, because Sonos does not send the byte-range requests YouTube requires. So the Tab5 acts as a small web server on port 8080. The speaker is told to play `http://<tab5>:8080/yt/...`, and the Tab5 downloads the video's MP4 file from YouTube into a 6 MB buffer in its memory and passes it on.
+2. YouTube refuses to serve the speaker directly, because Sonos does not send the byte-range requests YouTube requires. So the Tab5 acts as a small web server on port 8080. The speaker is told to play `http://<tab5>:8080/yt/...`, and the Tab5 downloads the video's MP4 file from YouTube into a 6 MB buffer in its memory. It then pulls the audio track out of that file and sends it to the speaker as a plain AAC stream, the way an internet radio station would. (Handing over the MP4 itself works for about twelve minutes. The speaker then runs out of its sample table and stops, so a long video would cut off.)
 3. The Tab5 must stay powered and on the network while YouTube plays.
 
 What that means in practice:
@@ -117,7 +117,8 @@ What that means in practice:
 - It uses an **undocumented** interface. YouTube can change or block it at any time, and it may stop working without warning. The client names and versions it presents are in a table in `src/youtube.cpp`, and you can try a different one at runtime with the `Yc` serial command, without reflashing.
 - Some videos will not play, for example age-restricted or region-locked ones, and videos where YouTube asks the client to prove it is not a bot. The status line says "No audio allowed for this video".
 - Live streams have not worked in testing.
-- The speaker plays the combined 360p MP4 and uses its audio track. The audio-only format dropped out on the speaker in testing, so it is not used.
+- The Tab5 downloads the combined 360p MP4, because the audio-only format dropped out on the speaker in testing. It only passes the audio on, but the whole file is read, so a long video uses its video bytes too.
+- It is played as a radio-style stream, so the speaker shows no length and cannot seek.
 - Using it may go against YouTube's Terms of Service. It is meant for personal use at home. You are responsible for how you use it.
 
 ## Serial commands
@@ -135,7 +136,7 @@ The Tab5 listens on its USB serial port (115200 baud). Open it **without** toggl
 | `Yq <words>` | Search YouTube. |
 | `Yk` | Star or unstar the playing YouTube video. |
 | `Yc name\|version\|ua` | Use a different YouTube client for the player request. |
-| `Ys` | Seek the speaker to five minutes (a test command). |
+| `Ys` | Seek the speaker to five minutes (a test command, no effect on the radio-style stream). |
 | `P` | Send a screenshot of the screen over serial (used by `tools/screenshot.py`). |
 | `U x y` | Inject a tap at screen position x, y (1280x720). |
 
