@@ -6,6 +6,10 @@ A touch-screen Sonos remote for the [M5Stack Tab5](https://docs.m5stack.com/en/c
 
 > **Status:** a hobby project that works well on the author's unit. It has been tested on one Tab5 and one Sonos system. Expect rough edges, and please open an issue if you find one.
 
+<p align="center">
+  <img src="docs/images/now-playing-youtube.png" alt="Now playing a YouTube video on a Sonos room" width="720">
+</p>
+
 ## What it does
 
 - **Sonos control.** Finds your speakers on the local network, shows every room, and controls the one you pick: play, pause, next, previous, volume, now playing with album art, the room's queue, and your Sonos favorites.
@@ -69,9 +73,17 @@ Tap **Browse**, then **Spotify**. Tap the search field to open the keyboard, typ
 - Tapping a song, album, playlist or artist opens it, so you can see what is inside before you play.
 - **My playlists** lists your own playlists.
 
+| Search | Open an item |
+| --- | --- |
+| ![Spotify search results](docs/images/spotify-search.png) | ![Spotify detail page](docs/images/spotify-detail.png) |
+
 ### YouTube
 
 Tap **Browse**, then **YouTube**, search, and tap a row to play it. The star on a row, or the star next to the title on the playing screen, saves the video. The **Starred** chip lists your saved videos with thumbnails. Tap a row to play it, or its star to remove it. Up to 24 videos are kept, and they survive a reboot.
+
+| Search | Starred |
+| --- | --- |
+| ![YouTube search results](docs/images/youtube-search.png) | ![Starred YouTube videos with thumbnails](docs/images/youtube-starred.png) |
 
 ## Spotify setup
 
@@ -124,6 +136,8 @@ The Tab5 listens on its USB serial port (115200 baud). Open it **without** toggl
 | `Yk` | Star or unstar the playing YouTube video. |
 | `Yc name\|version\|ua` | Use a different YouTube client for the player request. |
 | `Ys` | Seek the speaker to five minutes (a test command). |
+| `P` | Send a screenshot of the screen over serial (used by `tools/screenshot.py`). |
+| `U x y` | Inject a tap at screen position x, y (1280x720). |
 
 ## How it works
 
@@ -135,7 +149,7 @@ The Tab5 listens on its USB serial port (115200 baud). Open it **without** toggl
 | Spotify | `src/services.cpp` | Web API over HTTPS. Items are handed to Sonos as queue entries. |
 | YouTube | `src/youtube.cpp` | InnerTube search and player calls, a relay server, a read-ahead buffer, and the starred list in NVS. |
 | Board setup | `src/board.cpp` | A guard for the shared I2C bus. |
-| Tools | `tools/` | `spotify_auth.py` (one-time Spotify sign-in), `tab5serial.py` (serial helper), `make_font.py` (rebuilds `font_ui.h`). |
+| Tools | `tools/` | `spotify_auth.py` (one-time Spotify sign-in), `tab5serial.py` (serial helper), `screenshot.py` (takes a screenshot of the Tab5 over USB, with optional taps first; needs Pillow), `make_font.py` (rebuilds `font_ui.h`). |
 
 Network work runs on its own task, away from the drawing code, so the screen stays responsive.
 

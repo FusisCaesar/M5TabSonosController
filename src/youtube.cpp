@@ -104,6 +104,62 @@ bool videoIdOk(const char* id) {
     return true;
 }
 
+// The UI font covers U+0020..U+017F. Swap common punctuation for plain characters and drop what the
+// font cannot draw (emoji, CJK), so titles do not show empty boxes.
+void cleanText(char* s) {
+    if (!s) return;
+    const unsigned char* in = (const unsigned char*)s;
+    char* out = s;
+    bool lastSpace = true;
+    while (*in) {
+        uint32_t cp;
+        int len;
+        if (*in < 0x80) {
+            cp = *in;
+            len = 1;
+        } else if ((*in & 0xE0) == 0xC0) {
+            cp = *in & 0x1F;
+            len = 2;
+        } else if ((*in & 0xF0) == 0xE0) {
+            cp = *in & 0x0F;
+            len = 3;
+        } else if ((*in & 0xF8) == 0xF0) {
+            cp = *in & 0x07;
+            len = 4;
+        } else {
+            in++;
+            continue;
+        }
+        int used = 1;
+        while (used < len && (in[used] & 0xC0) == 0x80) cp = (cp << 6) | (in[used++] & 0x3F);
+        if (used < len) {
+            in += used;
+            continue;
+        }
+        const unsigned char* start = in;
+        in += len;
+        const char* repl = nullptr;
+        if (cp == 0x2018 || cp == 0x2019) repl = "'";
+        else if (cp == 0x201C || cp == 0x201D) repl = "\"";
+        else if (cp == 0x2013 || cp == 0x2014) repl = "-";
+        else if (cp == 0x2026) repl = "...";
+        if (repl) {
+            for (const char* r = repl; *r; r++) *out++ = *r;
+            lastSpace = false;
+        } else if (cp >= 0x20 && cp <= 0x17F && cp != 0x7F) {
+            if (cp == ' ') {
+                if (lastSpace) continue;
+                lastSpace = true;
+            } else {
+                lastSpace = false;
+            }
+            for (int i = 0; i < len; i++) *out++ = (char)start[i];
+        }
+    }
+    while (out > s && out[-1] == ' ') out--;
+    *out = 0;
+}
+
 bool ensureBuf() {
     if (httpBuf) return true;
     httpBuf = (char*)heap_caps_malloc(BODY_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -341,9 +397,16 @@ void resolveId(const char* id) {
         const char* reason = doc["playabilityStatus"]["reason"] | "";
         Serial.printf("[yt] %s playable %s %s\n", tag, status, reason);
         const char* gotTitle = doc["videoDetails"]["title"] | "";
-        if (gotTitle[0]) strlcpy(title, gotTitle, sizeof(title));
+        if (gotTitle[0]) {
+            strlcpy(title, gotTitle, sizeof(title));
+            cleanText(title);
+            if (!title[0]) strlcpy(title, "YouTube", sizeof(title));
+        }
         const char* gotAuthor = doc["videoDetails"]["author"] | "";
-        if (gotAuthor[0]) strlcpy(author, gotAuthor, sizeof(author));
+        if (gotAuthor[0]) {
+            strlcpy(author, gotAuthor, sizeof(author));
+            cleanText(author);
+        }
         const char* hls = doc["streamingData"]["hlsManifestUrl"] | "";
         Serial.printf("[yt] %s hls %u\n", tag, (unsigned)strlen(hls));
         int score = 0;
@@ -470,6 +533,9 @@ void addItem(const char* id, const char* title, const char* channel, int seconds
     strlcpy(it.id, id, sizeof(it.id));
     strlcpy(it.title, title && title[0] ? title : id, sizeof(it.title));
     strlcpy(it.channel, channel ? channel : "", sizeof(it.channel));
+    cleanText(it.title);
+    cleanText(it.channel);
+    if (!it.title[0]) strlcpy(it.title, id, sizeof(it.title));
     it.seconds = seconds;
     unlock();
 }
@@ -986,6 +1052,8 @@ void loadStars() {
         it.title[sizeof(it.title) - 1] = 0;
         it.channel[sizeof(it.channel) - 1] = 0;
         if (!videoIdOk(it.id)) continue;
+        cleanText(it.title);
+        cleanText(it.channel);
         published.stars[got++] = it;
     }
     published.starCount = got;
