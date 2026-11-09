@@ -5,6 +5,7 @@
 #include "services.h"
 #include "sonos.h"
 #include "ui.h"
+#include "youtube.h"
 
 #include <string.h>
 
@@ -14,6 +15,7 @@ static void netTask(void*) {
     else net::requestConnect("", "");
     for (;;) {
         net::loop(Serial);
+        yt::loop(net::connected());
         svc::loop(net::connected());
         if (net::connected()) sonos::loop();
         else if (!net::setupActive() && net::state() != net::State::Connecting && millis() > nextSetup) {
@@ -80,6 +82,37 @@ static void serialCommands() {
                 rest = sep ? sep + 1 : nullptr;
             }
             svc::storeCredentials(provider, id, token, secret);
+        } else if ((line[0] == 'Y' || line[0] == 'y') && (line[1] == 0 || line[1] == ' ')) {
+            const char* rest = line + 1;
+            while (*rest == ' ') rest++;
+            if (*rest) yt::requestResolve(rest);
+        } else if ((line[0] == 'Y' || line[0] == 'y') && (line[1] == 'q' || line[1] == 'Q') && line[2] == ' ') {
+            yt::requestSearch(line + 3);
+        } else if ((line[0] == 'Y' || line[0] == 'y') && (line[1] == 's' || line[1] == 'S') && line[2] == 0) {
+            yt::requestSeek();
+        } else if ((line[0] == 'Y' || line[0] == 'y') && (line[1] == 'k' || line[1] == 'K') && line[2] == 0) {
+            yt::starPlaying();
+        } else if ((line[0] == 'Y' || line[0] == 'y') && (line[1] == 'c' || line[1] == 'C') && line[2] == ' ') {
+            char name[24], version[32], ua[180];
+            name[0] = version[0] = ua[0] = 0;
+            const char* rest = line + 3;
+            const char* bar = strchr(rest, '|');
+            if (bar) {
+                size_t n = (size_t)(bar - rest);
+                if (n >= sizeof(name)) n = sizeof(name) - 1;
+                memcpy(name, rest, n);
+                name[n] = 0;
+                rest = bar + 1;
+                bar = strchr(rest, '|');
+                if (bar) {
+                    n = (size_t)(bar - rest);
+                    if (n >= sizeof(version)) n = sizeof(version) - 1;
+                    memcpy(version, rest, n);
+                    version[n] = 0;
+                    strlcpy(ua, bar + 1, sizeof(ua));
+                }
+            }
+            yt::setClient(name, version, ua);
         }
     }
 }
@@ -94,11 +127,13 @@ void setup() {
     net::begin();
     sonos::begin();
     svc::begin();
+    yt::begin();
     ui::begin();
 
     Serial.println("\n[boot] Tab5 Sonos");
     Serial.println("[boot] W ssid|password joins Wi-Fi, F forgets it");
     Serial.println("[boot] T probes Spotify TLS, X spotify signs out");
+    Serial.println("[boot] Y videoId plays YouTube, Yq words searches, Ys seeks, Yk stars or unstars the playing video, Yc name|version|ua");
     Serial.printf("[boot] heap %u  psram %u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
 
     xTaskCreatePinnedToCore(netTask, "net", 32 * 1024, nullptr, 1, nullptr, 0);

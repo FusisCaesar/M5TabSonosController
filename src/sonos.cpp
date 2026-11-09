@@ -117,6 +117,11 @@ char activeListId[240] = "";
 const char* browseId = "FV:2";
 char pickedArt[1400];
 char fetchUrl[2000];
+// What the Tab5 itself is relaying (YouTube). The speaker only knows a bare address, so the name,
+// channel and thumbnail shown come from here while its current address is the relay.
+char directTitle[100] = "";
+char directArtist[100] = "";
+char directArt[160] = "";
 
 uint32_t lastDiscover = 0;
 uint32_t lastTopo = 0;
@@ -1153,6 +1158,13 @@ bool getPosition(const char* ip) {
         pickArt(trackBuf, pickedArt, sizeof(pickedArt));
     }
     classifySource(trackUri[0] ? trackUri : pickedArt, source, sizeof(source));
+    if (directTitle[0] && strstr(trackUri, ":8080/yt/")) {
+        strlcpy(title, directTitle, sizeof(title));
+        strlcpy(artist, directArtist, sizeof(artist));
+        album[0] = 0;
+        strlcpy(source, "YouTube", sizeof(source));
+        strlcpy(pickedArt, directArt, sizeof(pickedArt));
+    }
     if (strcmp(title, lastTitle) != 0) {
         Serial.printf("[sonos] now '%s' / '%s' art %u\n", title, artist, (unsigned)strlen(pickedArt));
         if (trackUri[0]) Serial.printf("[sonos] uri %.220s\n", trackUri);
@@ -2214,6 +2226,71 @@ bool enqueue(const char* uri, const char* meta, bool playNow) {
         return true;
     }
     return queueAndPlay(c, uri, meta, playNow);
+}
+
+bool playDirect(const char* uri, const char* title) {
+    Room* c = transportRoom();
+    if (!c) {
+        setStatus("No room selected");
+        return false;
+    }
+    if (!uri || !uri[0]) return false;
+    Serial.printf("[sonos] direct %u bytes\n", (unsigned)strlen(uri));
+    char* meta = (char*)heap_caps_malloc(16 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!meta) {
+        setStatus("Out of memory");
+        return false;
+    }
+    Xml d;
+    d.reset(meta, 16 * 1024);
+    d.s("<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+        "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" "
+        "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
+        "<item id=\"yt\" parentID=\"-1\" restricted=\"true\"><dc:title>");
+    d.xml(title && title[0] ? title : "YouTube");
+    d.s("</dc:title><upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+        "<res protocolInfo=\"http-get:*:audio/mp4:*\">");
+    d.xml(uri);
+    d.s("</res></item></DIDL-Lite>");
+    const char* use = d.overflow ? "" : meta;
+    if (d.overflow) Serial.println("[sonos] direct metadata overflow");
+    bool opened = setUri(c->ip, uri, use);
+    bool started = false;
+    if (opened) {
+        for (int attempt = 0; attempt < 3 && !started; attempt++) {
+            if (attempt) delay(200);
+            started = avt(c->ip, "Play");
+        }
+    }
+    heap_caps_free(meta);
+    Serial.printf("[sonos] direct opened %d started %d\n", opened, started);
+    if (!started) {
+        setStatus(lastErr[0] ? lastErr : "Speaker refused the stream");
+        return false;
+    }
+    lock();
+    published.playing = true;
+    unlock();
+    lastPoll = 0;
+    return true;
+}
+
+void setDirectInfo(const char* title, const char* artist, const char* artUrl) {
+    strlcpy(directTitle, title ? title : "", sizeof(directTitle));
+    strlcpy(directArtist, artist ? artist : "", sizeof(directArtist));
+    strlcpy(directArt, artUrl ? artUrl : "", sizeof(directArt));
+}
+
+bool seekRel(const char* hms) {
+    Room* c = transportRoom();
+    if (!c || !hms || !hms[0]) return false;
+    bool ok = invoke(c->ip, AVT_PATH, AVT, "Seek", [&] {
+        el("InstanceID", "0");
+        el("Unit", "REL_TIME");
+        el("Target", hms);
+    });
+    Serial.printf("[sonos] seek %s %d\n", hms, ok);
+    return ok;
 }
 
 int spotifyAccount() { return spotifySn; }
