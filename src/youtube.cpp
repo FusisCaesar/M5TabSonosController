@@ -661,6 +661,11 @@ constexpr size_t LOOKAHEAD = 4u * 1024 * 1024;
 constexpr size_t KEEP_BEHIND = 512 * 1024;
 uint8_t* ring = nullptr;
 char* fetchUrl = nullptr;
+// The speaker re-reads the MP4 index (the start of the file) while it plays. The ring has long moved on
+// by then, so the first bytes are kept for good and can be served at once.
+constexpr size_t HEAD_CAP = 6u * 1024 * 1024;
+uint8_t* headCache = nullptr;
+volatile size_t headFilled = 0;  // bytes of the file start held in headCache
 volatile size_t fillPos = 0;    // next absolute byte the fetcher will write
 volatile size_t headPos = 0;    // where the speaker is reading
 volatile size_t totalSize = 0;  // 0 until the first answer says how big the file is
@@ -686,6 +691,7 @@ void fetchTask(void*) {
             totalSize = 0;
             fetchEof = false;
             fetchFailed = false;
+            headFilled = 0;
             seekReq = -1;
             failures = 0;
             fetchEpoch = fetchEpoch + 1;
@@ -748,6 +754,12 @@ void fetchTask(void*) {
                             memcpy(ring + off, buf, first);
                             memcpy(ring, buf + first, got - first);
                         }
+                        if (headCache && at == headFilled && at < HEAD_CAP) {
+                            size_t c = HEAD_CAP - at;
+                            if (c > (size_t)got) c = (size_t)got;
+                            memcpy(headCache + at, buf, c);
+                            headFilled = at + c;
+                        }
                         fillPos = at + got;
                         gotChunk += (size_t)got;
                         lastData = millis();
@@ -776,9 +788,361 @@ void fetchTask(void*) {
             totalSize = fillPos;
             fetchEof = true;
         }
-        Serial.printf("[yt] fetch to %u of %u, speaker at %u\n", (unsigned)fillPos, (unsigned)totalSize,
-                      (unsigned)headPos);
+        Serial.printf("[yt] fetch to %u of %u, speaker at %u, heap %u (largest %u), psram %u\n", (unsigned)fillPos,
+                      (unsigned)totalSize, (unsigned)headPos, (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)ESP.getFreePsram());
     }
+}
+
+volatile int ringClients = 0;    // connections currently reading from the ring
+volatile int activeClients = 0;  // connection tasks alive
+
+// Copy one closed range from YouTube straight to a client, without touching the ring.
+bool proxyChunk(WiFiClient& client, uint32_t myGen, size_t& pos, size_t total) {
+    uint8_t buf[4096];
+    size_t endByte = pos + FETCH_CHUNK - 1;
+    if (endByte >= total) endByte = total - 1;
+    char spec[48];
+    snprintf(spec, sizeof(spec), "bytes=%u-%u", (unsigned)pos, (unsigned)endByte);
+    WiFiClientSecure up;
+    up.useBuiltinCACertBundle();
+    up.setHandshakeTimeout(8);
+    HTTPClient http;
+    http.setTimeout(15000);
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    size_t got = 0;
+    int code = -1;
+    if (fetchUrl && http.begin(up, fetchUrl)) {
+        http.addHeader("Range", spec);
+        code = http.GET();
+        if (code == 206 || (code == 200 && pos == 0)) {
+            NetworkClient* stream = http.getStreamPtr();
+            uint32_t lastData = millis();
+            while (stream && relayGen == myGen && client.connected() && pos <= endByte) {
+                int n = stream->read(buf, sizeof(buf));
+                if (n > 0) {
+                    int off = 0;
+                    uint32_t stall = millis();
+                    while (off < n && client.connected() && relayGen == myGen && millis() - stall < 25000) {
+                        size_t w = client.write(buf + off, n - off);
+                        if (w == 0) {
+                            vTaskDelay(pdMS_TO_TICKS(5));
+                            continue;
+                        }
+                        off += (int)w;
+                        stall = millis();
+                    }
+                    if (off < n) break;
+                    pos += n;
+                    got += n;
+                    lastData = millis();
+                    continue;
+                }
+                if (!stream->connected()) break;
+                if (millis() - lastData > 10000) break;
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+    }
+    http.end();
+    if (got == 0) Serial.printf("[yt] side read %s failed (%d)\n", spec, code);
+    return got > 0;
+}
+
+// ---- MP4 audio to ADTS -------------------------------------------------------------------------
+// The speaker cannot play the MP4 file for long: it loads the sample table in pieces and gives up after
+// about 32768 audio samples (roughly twelve minutes). So the relay does not hand over the MP4. It reads
+// the audio track's sample table from the start of the file (moov, kept in headCache), picks the audio
+// out of the interleaved file as it streams by, and sends it as a plain ADTS AAC stream, like a radio
+// station. That has no index and no length, so there is nothing for the speaker to run out of.
+constexpr bool ADTS_MODE = true;
+
+struct AacInfo {
+    uint32_t gen = 0;
+    int state = 0;  // 0 not parsed yet, 1 ready, -1 not usable
+    const uint8_t* stsc = nullptr;
+    uint32_t stscCount = 0;
+    const uint8_t* stco = nullptr;
+    uint32_t stcoCount = 0;
+    const uint8_t* stsz = nullptr;
+    uint32_t stszCount = 0;
+    uint32_t stszConst = 0;
+    uint8_t b2 = 0;      // ADTS byte 2 without the channel high bit
+    uint8_t chan = 0;
+};
+AacInfo aac;
+volatile int aacLock = 0;
+volatile uint32_t aacNext = 0;   // next audio sample to send
+volatile uint32_t aacOwner = 0;  // the connection that streams right now (a newer one takes over)
+
+inline uint32_t be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+// Finds the next box of `type` between start and end. Returns its body range.
+bool findBox(const uint8_t* b, size_t start, size_t end, const char* type, size_t* bodyStart, size_t* bodyEnd) {
+    while (start + 8 <= end) {
+        uint32_t size = be32(b + start);
+        size_t hdr = 8;
+        if (size == 1) {
+            if (start + 16 > end || be32(b + start + 8) != 0) return false;
+            size = be32(b + start + 12);
+            hdr = 16;
+        } else if (size == 0) {
+            size = (uint32_t)(end - start);
+        }
+        if (size < hdr || start + size > end) return false;
+        if (memcmp(b + start + 4, type, 4) == 0) {
+            *bodyStart = start + hdr;
+            *bodyEnd = start + size;
+            return true;
+        }
+        start += size;
+    }
+    return false;
+}
+
+// 1 ready, 0 needs more of the file, -1 cannot be used.
+int parseAac(AacInfo& a) {
+    const uint8_t* b = headCache;
+    const size_t filled = headFilled;
+    size_t p = 0, moovS = 0, moovE = 0;
+    while (p + 8 <= filled) {
+        uint32_t size = be32(b + p);
+        if (size < 8) return -1;
+        if (memcmp(b + p + 4, "moov", 4) == 0) {
+            if (p + size > filled) return filled >= HEAD_CAP ? -1 : 0;
+            moovS = p + 8;
+            moovE = p + size;
+            break;
+        }
+        if (memcmp(b + p + 4, "mdat", 4) == 0) return -1;  // index at the end: not handled
+        p += size;
+    }
+    if (!moovE) return filled >= HEAD_CAP ? -1 : 0;
+    size_t t = moovS, ts = 0, te = 0, ms = 0, me = 0;
+    bool found = false;
+    while (findBox(b, t, moovE, "trak", &ts, &te)) {
+        size_t hs, he;
+        if (findBox(b, ts, te, "mdia", &ms, &me) && findBox(b, ms, me, "hdlr", &hs, &he) && he - hs >= 12 &&
+            memcmp(b + hs + 8, "soun", 4) == 0) {
+            found = true;
+            break;
+        }
+        t = te;
+    }
+    if (!found) return -1;
+    size_t is, ie, ss, se, a1, a2, e1, e2;
+    if (!findBox(b, ms, me, "minf", &is, &ie) || !findBox(b, is, ie, "stbl", &ss, &se)) return -1;
+    size_t stsdS, stsdE, stscS, stscE, stcoS, stcoE, stszS, stszE;
+    if (!findBox(b, ss, se, "stsd", &stsdS, &stsdE) || !findBox(b, ss, se, "stsc", &stscS, &stscE) ||
+        !findBox(b, ss, se, "stco", &stcoS, &stcoE) || !findBox(b, ss, se, "stsz", &stszS, &stszE))
+        return -1;
+    // stsd: version/flags, count, then the mp4a entry (box header, 28 bytes of fields, child boxes).
+    if (stsdE - stsdS < 8 + 8 + 28 || memcmp(b + stsdS + 12, "mp4a", 4) != 0) return -1;
+    size_t entryEnd = stsdS + 8 + be32(b + stsdS + 8);
+    if (entryEnd > stsdE) entryEnd = stsdE;
+    if (!findBox(b, stsdS + 8 + 8 + 28, entryEnd, "esds", &e1, &e2)) return -1;
+    (void)a1;
+    (void)a2;
+    const uint8_t* d = b + e1 + 4;
+    const uint8_t* dEnd = b + e2;
+    auto readLen = [&](const uint8_t*& q) {
+        uint32_t l = 0;
+        for (int i = 0; i < 4 && q < dEnd; i++) {
+            uint8_t c = *q++;
+            l = (l << 7) | (c & 0x7F);
+            if (!(c & 0x80)) break;
+        }
+        return l;
+    };
+    if (d >= dEnd || *d++ != 0x03) return -1;
+    readLen(d);
+    d += 2;
+    if (d >= dEnd) return -1;
+    uint8_t flags = *d++;
+    if (flags & 0x80) d += 2;
+    if (flags & 0x40) {
+        if (d >= dEnd) return -1;
+        d += 1 + *d;
+    }
+    if (flags & 0x20) d += 2;
+    if (d >= dEnd || *d++ != 0x04) return -1;
+    readLen(d);
+    d += 13;
+    if (d >= dEnd || *d++ != 0x05) return -1;
+    readLen(d);
+    if (d + 2 > dEnd) return -1;
+    uint8_t aot = d[0] >> 3;
+    uint8_t freq = ((d[0] & 7) << 1) | (d[1] >> 7);
+    uint8_t chan = (d[1] >> 3) & 0x0F;
+    if (aot < 1 || aot > 4 || freq >= 13 || chan < 1 || chan > 7) {
+        Serial.printf("[yt] aac: audio type %u freq %u chan %u not handled\n", aot, freq, chan);
+        return -1;
+    }
+    a.b2 = (uint8_t)(((aot - 1) << 6) | (freq << 2) | (chan >> 2));
+    a.chan = chan;
+    if (stscE - stscS < 8 || stcoE - stcoS < 8 || stszE - stszS < 12) return -1;
+    a.stscCount = be32(b + stscS + 4);
+    a.stsc = b + stscS + 8;
+    a.stcoCount = be32(b + stcoS + 4);
+    a.stco = b + stcoS + 8;
+    a.stszConst = be32(b + stszS + 4);
+    a.stszCount = be32(b + stszS + 8);
+    a.stsz = b + stszS + 12;
+    if (stscS + 8 + (size_t)a.stscCount * 12 > stscE || stcoS + 8 + (size_t)a.stcoCount * 4 > stcoE ||
+        (!a.stszConst && stszS + 12 + (size_t)a.stszCount * 4 > stszE) || !a.stscCount || !a.stcoCount)
+        return -1;
+    Serial.printf("[yt] aac: type %u freq %u chan %u, %u chunks, %u samples, moov %u bytes\n", aot, freq, chan,
+                  (unsigned)a.stcoCount, (unsigned)a.stszCount, (unsigned)(moovE - moovS));
+    return 1;
+}
+
+int aacReady(uint32_t myGen) {
+    while (__sync_lock_test_and_set(&aacLock, 1)) vTaskDelay(pdMS_TO_TICKS(2));
+    if (aac.gen != myGen) {
+        aac = AacInfo();
+        aac.gen = myGen;
+        aacNext = 0;
+    }
+    if (aac.state == 0 && fetchGen == myGen && headCache) {
+        int r = parseAac(aac);
+        if (r != 0) aac.state = r;
+    }
+    int s = aac.state;
+    __sync_lock_release(&aacLock);
+    return s;
+}
+
+// Makes sure file bytes [start, end) are in the ring. The ring is only moved by the one streaming client.
+bool ringHas(size_t start, size_t end, uint32_t myGen, uint32_t mine) {
+    uint32_t waitFrom = millis();
+    for (;;) {
+        if (relayGen != myGen || aacOwner != mine) return false;
+        size_t fill = fillPos;
+        size_t validStart = fill > RING_CAP - FETCH_CHUNK ? fill - (RING_CAP - FETCH_CHUNK) : 0;
+        if (start < validStart || start > fill + 4 * FETCH_CHUNK) {
+            uint32_t epoch = fetchEpoch;
+            seekReq = (int32_t)start;
+            uint32_t w0 = millis();
+            while (relayGen == myGen && fetchEpoch == epoch && millis() - w0 < 15000) vTaskDelay(pdMS_TO_TICKS(5));
+            waitFrom = millis();
+            continue;
+        }
+        if (end <= fill) return true;
+        if (fetchEof || fetchFailed || millis() - waitFrom > 25000) return false;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+struct Out {
+    WiFiClient* c;
+    uint8_t buf[4096];
+    size_t n = 0;
+    bool bad = false;
+    void flush(uint32_t myGen) {
+        size_t off = 0;
+        uint32_t stall = millis();
+        while (off < n && c->connected() && relayGen == myGen && millis() - stall < 30000) {
+            size_t w = c->write(buf + off, n - off);
+            if (w == 0) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            off += w;
+            stall = millis();
+        }
+        if (off < n) bad = true;
+        n = 0;
+    }
+    void add(const uint8_t* p, size_t len, uint32_t myGen) {
+        while (len && !bad) {
+            size_t room = sizeof(buf) - n;
+            size_t k = len < room ? len : room;
+            memcpy(buf + n, p, k);
+            n += k;
+            p += k;
+            len -= k;
+            if (n == sizeof(buf)) flush(myGen);
+        }
+    }
+};
+
+void serveAac(WiFiClient& client, uint32_t myGen) {
+    const uint32_t mine = __sync_add_and_fetch(&aacOwner, 1);
+    uint32_t t0 = millis();
+    int ready;
+    while ((ready = aacReady(myGen)) == 0 && relayGen == myGen && millis() - t0 < 40000) vTaskDelay(pdMS_TO_TICKS(20));
+    if (ready != 1 || relayGen != myGen) {
+        Serial.println("[yt] aac: audio index not usable");
+        client.print("HTTP/1.0 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+        client.stop();
+        return;
+    }
+    client.print("HTTP/1.0 200 OK\r\nContent-Type: audio/aac\r\nicy-name: YouTube\r\nCache-Control: no-cache\r\n"
+                 "Connection: close\r\n\r\n");
+    const AacInfo& a = aac;
+    uint32_t s = aacNext;
+    // Find the chunk that holds sample s.
+    uint32_t c = 0, fs = 0, run = 0, spc = 0;
+    for (;; c++) {
+        if (c >= a.stcoCount) break;
+        while (run + 1 < a.stscCount && be32(a.stsc + 12 * (run + 1)) <= c + 1) run++;
+        spc = be32(a.stsc + 12 * run + 4);
+        if (fs + spc > s) break;
+        fs += spc;
+    }
+    Serial.printf("[yt] aac: streaming from sample %u (chunk %u)\n", (unsigned)s, (unsigned)c);
+    Out* out = new Out();
+    out->c = &client;
+    uint32_t sent = 0;
+    while (c < a.stcoCount && client.connected() && relayGen == myGen && aacOwner == mine && !out->bad) {
+        while (run + 1 < a.stscCount && be32(a.stsc + 12 * (run + 1)) <= c + 1) run++;
+        spc = be32(a.stsc + 12 * run + 4);
+        size_t off = be32(a.stco + 4 * c);
+        for (uint32_t i = fs; i < fs + spc && i < a.stszCount; i++) {
+            size_t sz = a.stszConst ? a.stszConst : be32(a.stsz + 4 * i);
+            if (i < s) {
+                off += sz;
+                continue;
+            }
+            if (!ringHas(off, off + sz, myGen, mine)) {
+                out->bad = true;
+                break;
+            }
+            headPos = off;
+            uint32_t len = (uint32_t)sz + 7;
+            uint8_t h[7] = {0xFF,
+                            0xF1,
+                            a.b2,
+                            (uint8_t)(((a.chan & 3) << 6) | (len >> 11)),
+                            (uint8_t)((len >> 3) & 0xFF),
+                            (uint8_t)(((len & 7) << 5) | 0x1F),
+                            0xFC};
+            out->add(h, 7, myGen);
+            size_t ro = off % RING_CAP;
+            size_t first = RING_CAP - ro;
+            if (sz <= first) {
+                out->add(ring + ro, sz, myGen);
+            } else {
+                out->add(ring + ro, first, myGen);
+                out->add(ring, sz - first, myGen);
+            }
+            off += sz;
+            s = i + 1;
+            aacNext = s;
+            sent++;
+            if (out->bad) break;
+        }
+        fs += spc;
+        c++;
+    }
+    if (!out->bad) out->flush(myGen);
+    delete out;
+    client.stop();
+    Serial.printf("[yt] aac: client closed after %u samples, next %u of %u\n", (unsigned)sent, (unsigned)aacNext,
+                  (unsigned)aac.stszCount);
 }
 
 void serveRelay(WiFiClient& client) {
@@ -827,9 +1191,15 @@ void serveRelay(WiFiClient& client) {
         client.stop();
         return;
     }
+    Serial.printf("[yt] relay request '%s' range '%s'\n", request, range);
     if (strncmp(request, "HEAD", 4) == 0) {
-        client.print("HTTP/1.0 200 OK\r\nContent-Type: audio/mp4\r\nConnection: close\r\n\r\n");
+        client.printf("HTTP/1.0 200 OK\r\nContent-Type: %s\r\nConnection: close\r\n\r\n",
+                      ADTS_MODE ? "audio/aac" : "audio/mp4");
         client.stop();
+        return;
+    }
+    if (ADTS_MODE) {
+        serveAac(client, myGen);
         return;
     }
     // Wait until the fetcher has taken this stream and learned the file size.
@@ -866,17 +1236,68 @@ void serveRelay(WiFiClient& client) {
                       (unsigned)total);
     }
     const size_t first = pos;
-    headPos = pos;
     uint32_t progress = millis();
+    bool inRing = false;  // reading from the ring (at most one client may move the ring)
+    bool proxied = false;
     while (client.connected() && relayGen == myGen && pos < total) {
         size_t fill = fillPos;
         size_t validStart = fill > RING_CAP - FETCH_CHUNK ? fill - (RING_CAP - FETCH_CHUNK) : 0;
-        if (pos < validStart || pos > fill + RING_CAP / 2) {
-            // Outside what is buffered: ask the fetcher to restart there.
-            uint32_t epoch = fetchEpoch;
-            seekReq = (int32_t)pos;
-            uint32_t w0 = millis();
-            while (relayGen == myGen && fetchEpoch == epoch && millis() - w0 < 15000) vTaskDelay(pdMS_TO_TICKS(5));
+        bool avail = pos >= validStart && pos <= fill + 4 * FETCH_CHUNK;
+        if (!inRing && !avail && pos < headFilled) {
+            // An index read near the start of the file: answer from the kept copy, the ring stays put.
+            if (!proxied) {
+                proxied = true;
+                Serial.printf("[yt] relay head read from %u\n", (unsigned)pos);
+            }
+            size_t n = headFilled - pos;
+            if (n > 8192) n = 8192;
+            size_t w = client.write(headCache + pos, n);
+            if (w == 0) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            pos += w;
+            progress = millis();
+            continue;
+        }
+        if (!inRing) {
+            if (avail) {
+                inRing = true;
+                __sync_fetch_and_add(&ringClients, 1);
+                if (pos > headPos) headPos = pos;
+            } else if (ringClients == 0) {
+                // Nobody else is reading the ring: restart the fetcher at this position.
+                inRing = true;
+                __sync_fetch_and_add(&ringClients, 1);
+                uint32_t epoch = fetchEpoch;
+                seekReq = (int32_t)pos;
+                uint32_t w0 = millis();
+                while (relayGen == myGen && fetchEpoch == epoch && millis() - w0 < 15000) vTaskDelay(pdMS_TO_TICKS(5));
+                progress = millis();
+                continue;
+            }
+        } else if (!avail) {
+            if (ringClients > 1) {
+                // Another client owns the ring now. Leave it and read straight from YouTube.
+                inRing = false;
+                __sync_fetch_and_sub(&ringClients, 1);
+            } else {
+                uint32_t epoch = fetchEpoch;
+                seekReq = (int32_t)pos;
+                uint32_t w0 = millis();
+                while (relayGen == myGen && fetchEpoch == epoch && millis() - w0 < 15000) vTaskDelay(pdMS_TO_TICKS(5));
+                progress = millis();
+                continue;
+            }
+        }
+        if (!inRing) {
+            // The speaker opened a second connection somewhere the ring does not cover (it re-reads the
+            // MP4 index while playing). Serve it with its own ranged requests so the ring keeps going.
+            if (!proxied) {
+                proxied = true;
+                Serial.printf("[yt] relay side read from %u\n", (unsigned)pos);
+            }
+            if (!proxyChunk(client, myGen, pos, total)) break;
             progress = millis();
             continue;
         }
@@ -895,12 +1316,21 @@ void serveRelay(WiFiClient& client) {
             continue;
         }
         pos += w;
-        headPos = pos;
+        if (ringClients <= 1 || pos > headPos) headPos = pos;
         progress = millis();
     }
+    if (inRing) __sync_fetch_and_sub(&ringClients, 1);
     client.stop();
     Serial.printf("[yt] relay client closed at %u of %u (from %u, buffered to %u)\n", (unsigned)pos,
                   (unsigned)total, (unsigned)first, (unsigned)fillPos);
+}
+
+void clientTask(void* arg) {
+    WiFiClient* c = (WiFiClient*)arg;
+    serveRelay(*c);
+    delete c;
+    __sync_fetch_and_sub(&activeClients, 1);
+    vTaskDelete(nullptr);
 }
 
 void relayTask(void*) {
@@ -921,7 +1351,21 @@ void relayTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        serveRelay(client);
+        // The speaker may hold one connection for the music and open more for the MP4 index, and it
+        // gives up on all of them if one is left unanswered. So every connection gets its own task.
+        if (activeClients >= 4) {
+            client.print("HTTP/1.0 503 Busy\r\nConnection: close\r\n\r\n");
+            client.stop();
+            continue;
+        }
+        WiFiClient* copy = new WiFiClient(client);
+        __sync_fetch_and_add(&activeClients, 1);
+        if (xTaskCreatePinnedToCore(clientTask, "ytc", 24 * 1024, copy, 1, nullptr, 0) != pdPASS) {
+            __sync_fetch_and_sub(&activeClients, 1);
+            copy->stop();
+            delete copy;
+            Serial.println("[yt] relay could not start a client task");
+        }
     }
 }
 
@@ -1187,7 +1631,9 @@ void begin() {
     loadStars();
     ring = (uint8_t*)heap_caps_malloc(RING_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     fetchUrl = (char*)heap_caps_malloc(6500, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    headCache = (uint8_t*)heap_caps_malloc(HEAD_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ring || !fetchUrl) Serial.println("[yt] no memory for the relay buffer");
+    if (!headCache) Serial.println("[yt] no memory for the head cache");
     xTaskCreatePinnedToCore(fetchTask, "ytfetch", 24 * 1024, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(relayTask, "ytrelay", 12 * 1024, nullptr, 1, nullptr, 0);
 }
