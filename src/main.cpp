@@ -2,6 +2,7 @@
 
 #include "board.h"
 #include "net.h"
+#include "services.h"
 #include "sonos.h"
 #include "ui.h"
 
@@ -13,6 +14,7 @@ static void netTask(void*) {
     else net::requestConnect("", "");
     for (;;) {
         net::loop(Serial);
+        svc::loop(net::connected());
         if (net::connected()) sonos::loop();
         else if (!net::setupActive() && net::state() != net::State::Connecting && millis() > nextSetup) {
             nextSetup = millis() + 5000;
@@ -23,7 +25,7 @@ static void netTask(void*) {
 }
 
 static void serialCommands() {
-    static char line[160];
+    static char line[700];
     static int len = 0;
     while (Serial.available()) {
         char c = Serial.read();
@@ -56,6 +58,28 @@ static void serialCommands() {
             }
         } else if ((line[0] == 'F' || line[0] == 'f') && line[1] == 0) {
             net::requestForget();
+        } else if ((line[0] == 'T' || line[0] == 't') && line[1] == 0) {
+            svc::requestProbe();
+        } else if ((line[0] == 'X' || line[0] == 'x') && (line[1] == 0 || line[1] == ' ')) {
+            const char* name = line + 1;
+            while (*name == ' ') name++;
+            svc::clearCredentials(name[0] ? name : "spotify");
+        } else if ((line[0] == 'S' || line[0] == 's') && (line[1] == 0 || line[1] == ' ')) {
+            const char* rest = line + 1;
+            while (*rest == ' ') rest++;
+            char provider[16], id[48], token[400], secret[80];
+            provider[0] = id[0] = token[0] = secret[0] = 0;
+            char* fields[] = {provider, id, token, secret};
+            size_t caps[] = {sizeof(provider), sizeof(id), sizeof(token), sizeof(secret)};
+            for (int i = 0; i < 4 && rest && *rest; i++) {
+                const char* sep = strchr(rest, '|');
+                size_t n = sep ? (size_t)(sep - rest) : strlen(rest);
+                if (n >= caps[i]) n = caps[i] - 1;
+                memcpy(fields[i], rest, n);
+                fields[i][n] = 0;
+                rest = sep ? sep + 1 : nullptr;
+            }
+            svc::storeCredentials(provider, id, token, secret);
         }
     }
 }
@@ -69,13 +93,15 @@ void setup() {
     board::begin();
     net::begin();
     sonos::begin();
+    svc::begin();
     ui::begin();
 
     Serial.println("\n[boot] Tab5 Sonos");
     Serial.println("[boot] W ssid|password joins Wi-Fi, F forgets it");
+    Serial.println("[boot] T probes Spotify TLS, X spotify signs out");
     Serial.printf("[boot] heap %u  psram %u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
 
-    xTaskCreatePinnedToCore(netTask, "net", 20 * 1024, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(netTask, "net", 32 * 1024, nullptr, 1, nullptr, 0);
 }
 
 void loop() {

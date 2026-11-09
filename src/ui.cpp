@@ -4,6 +4,7 @@
 #include "display_fb.h"
 #include "font_ui.h"
 #include "net.h"
+#include "services.h"
 #include "sonos.h"
 
 #include <esp_heap_caps.h>
@@ -44,8 +45,9 @@ constexpr Box PREV{408, 608, 120, 88};
 constexpr Box PLAY{540, 600, 136, 100};
 constexpr Box NEXT{688, 608, 120, 88};
 constexpr Box VOL{828, 612, 428, 84};
-constexpr Box QUEUE{868, 18, 186, 72};
-constexpr Box FAV{1068, 18, 196, 72};
+constexpr Box BROWSE{700, 18, 156, 72};
+constexpr Box QUEUE{868, 18, 150, 72};
+constexpr Box FAV{1030, 18, 234, 72};
 
 M5Canvas canvas;
 M5Canvas art;
@@ -54,8 +56,12 @@ constexpr size_t JPG_CAP = 1024 * 1024;
 bool ready = false;
 bool hasArt = false;
 int shownGen = -1;
-enum class Panel : uint8_t { Closed, Queue, Favs };
+enum class Panel : uint8_t { Closed, Queue, Favs, Browse };
 Panel panel = Panel::Closed;
+svc::View browse;
+bool keyboard = false;
+char query[64] = "";
+int browseScroll = 0;
 int roomScroll = 0;
 int favScroll = 0;
 
@@ -320,6 +326,129 @@ void drawWifi(M5Canvas& c) {
     }
 }
 
+const char* kindName(svc::Kind kind) {
+    if (kind == svc::Kind::Album) return "Album";
+    if (kind == svc::Kind::Playlist) return "Playlist";
+    if (kind == svc::Kind::Artist) return "Artist";
+    return "Song";
+}
+
+constexpr int KEY_Y = 392;
+
+char keyAt(int x, int y) {
+    if (!keyboard || y < KEY_Y || y >= FAV_B) return 0;
+    const char* rows[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
+    for (int row = 0; row < 3; row++) {
+        int cols = (int)strlen(rows[row]) + (row == 2 ? 1 : 0);
+        int gap = 8;
+        int w = (FAV_W - (cols - 1) * gap) / cols;
+        for (int col = 0; col < (int)strlen(rows[row]); col++) {
+            int bx = FAV_X + col * (w + gap);
+            int by = KEY_Y + row * 56;
+            if (x >= bx && y >= by && x < bx + w && y < by + 48) return rows[row][col];
+        }
+        if (row == 2) {
+            int col = (int)strlen(rows[row]);
+            int bx = FAV_X + col * (w + gap);
+            int by = KEY_Y + row * 56;
+            if (x >= bx && y >= by && x < bx + w && y < by + 48) return '\b';
+        }
+    }
+    int by = KEY_Y + 168;
+    if (y >= by && y < by + 48) {
+        if (x >= FAV_X && x < FAV_X + 520) return ' ';
+        if (x >= FAV_X + 536 && x < FAV_X + FAV_W) return '\n';
+    }
+    return 0;
+}
+
+void drawKey(M5Canvas& c, int x, int y, int w, const char* label, bool accent) {
+    c.fillRoundRect(x, y, w, 48, 10, accent ? COL_ACCENT : COL_CARD2);
+    c.setFont(&fontBody);
+    c.setTextColor(accent ? COL_BG : COL_TEXT);
+    c.setTextDatum(MC_DATUM);
+    c.drawString(label, x + w / 2, y + 24);
+    c.setTextDatum(TL_DATUM);
+}
+
+void drawKeyboard(M5Canvas& c) {
+    const char* rows[] = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
+    for (int row = 0; row < 3; row++) {
+        int cols = (int)strlen(rows[row]) + (row == 2 ? 1 : 0);
+        int gap = 8;
+        int w = (FAV_W - (cols - 1) * gap) / cols;
+        for (int col = 0; col < (int)strlen(rows[row]); col++) {
+            char label[2] = {rows[row][col], 0};
+            drawKey(c, FAV_X + col * (w + gap), KEY_Y + row * 56, w, label, false);
+        }
+        if (row == 2) {
+            int col = (int)strlen(rows[row]);
+            drawKey(c, FAV_X + col * (w + gap), KEY_Y + row * 56, w, "del", false);
+        }
+    }
+    drawKey(c, FAV_X, KEY_Y + 168, 512, "space", false);
+    drawKey(c, FAV_X + 536, KEY_Y + 168, FAV_W - 536, "Search", true);
+}
+
+void drawBrowse(M5Canvas& c) {
+    c.setFont(&fontUi);
+    text(c, svc::providerName(), FAV_X, FAV_Y, 180, COL_ACCENT);
+    bool lists = pressing && !moved && x0 >= FAV_X + 200 && x0 < FAV_X + 420 && y0 >= FAV_Y && y0 < FAV_Y + 44;
+    c.fillRoundRect(FAV_X + 200, FAV_Y, 210, 44, 10, lists ? COL_ACCENT : COL_CARD);
+    c.setTextDatum(MC_DATUM);
+    c.setTextColor(lists ? COL_BG : COL_TEXT);
+    c.drawString("My playlists", FAV_X + 305, FAV_Y + 22);
+    c.setTextDatum(TL_DATUM);
+
+    int listTop = FAV_Y + 100;
+    int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
+    c.fillRoundRect(FAV_X, FAV_Y + 52, FAV_W, 40, 10, COL_CARD2);
+    c.setFont(&fontBody);
+    text(c, query[0] ? query : "Search Spotify", FAV_X + 16, FAV_Y + 58, FAV_W - 32, query[0] ? COL_TEXT : COL_MUTED);
+
+    if (browse.status[0]) text(c, browse.status, FAV_X, listTop, FAV_W, COL_MUTED);
+    int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
+    int viewH = listBottom - listTop;
+    int maxS = listMax(rows, viewH, FAV_H);
+    if (browseScroll > maxS) browseScroll = maxS;
+    if (browseScroll < 0) browseScroll = 0;
+    c.setClipRect(FAV_X, listTop, FAV_W, viewH);
+    if (browse.loading && browse.count == 0) {
+        text(c, "Loading Spotify...", FAV_X, listTop + 8, FAV_W, COL_MUTED);
+    }
+    for (int i = 0; i < browse.count; i++) {
+        int y = listTop + i * FAV_H - browseScroll;
+        if (y + FAV_H < listTop || y > listBottom) continue;
+        c.fillRoundRect(FAV_X, y + 4, FAV_W - 72, FAV_H - 8, 12, COL_CARD);
+        c.setFont(&fontBody);
+        char line[100];
+        snprintf(line, sizeof(line), "%s", browse.items[i].title);
+        text(c, line, FAV_X + 16, y + 10, FAV_W - 100, COL_TEXT);
+        snprintf(line, sizeof(line), "%s%s%s", kindName(browse.items[i].kind), browse.items[i].subtitle[0] ? "  " : "",
+                 browse.items[i].subtitle);
+        c.setFont(&fontBody);
+        text(c, line, FAV_X + 16, y + 40, FAV_W - 100, COL_MUTED);
+        bool hot = pressing && !moved && x0 >= FAV_X + FAV_W - 64 && x0 < FAV_X + FAV_W && y0 >= y + 14 && y0 < y + 62;
+        c.fillRoundRect(FAV_X + FAV_W - 60, y + 16, 48, 44, 10, hot ? COL_ACCENT : COL_CARD2);
+        c.setTextDatum(MC_DATUM);
+        c.setTextColor(hot ? COL_BG : COL_TEXT);
+        c.setFont(&fontUi);
+        c.drawString("+", FAV_X + FAV_W - 36, y + 38);
+        c.setTextDatum(TL_DATUM);
+    }
+    if (browse.more || browse.offset > 0) {
+        int y = listTop + browse.count * FAV_H - browseScroll;
+        if (y + FAV_H >= listTop && y <= listBottom) {
+            c.setFont(&fontBody);
+            char page[40];
+            snprintf(page, sizeof(page), "%s%s", browse.offset > 0 ? "Back" : "", browse.more ? (browse.offset > 0 ? "    More" : "More") : "");
+            text(c, page, FAV_X + 16, y + 18, FAV_W, COL_ACCENT);
+        }
+    }
+    c.clearClipRect();
+    if (keyboard) drawKeyboard(c);
+}
+
 void drawMain(M5Canvas& c) {
     c.fillSprite(COL_BG);
     c.setTextDatum(TL_DATUM);
@@ -327,7 +456,7 @@ void drawMain(M5Canvas& c) {
     c.setTextColor(COL_TEXT);
     c.drawString("Sonos", 24, 22);
     if (!view.household) text(c, "Searching for speakers...", 180, 22, 660, COL_MUTED);
-    else if (view.groupName[0]) text(c, view.groupName, 180, 22, 660, COL_TEXT);
+    else if (view.groupName[0]) text(c, view.groupName, 180, 22, 500, COL_TEXT);
     c.setFont(&fontBody);
     if (net::localIp()[0]) text(c, net::localIp(), 24, 66, 280, COL_MUTED);
 
@@ -340,6 +469,7 @@ void drawMain(M5Canvas& c) {
         c.drawString(label, b.x + b.w / 2, b.y + b.h / 2);
         c.setTextDatum(TL_DATUM);
     };
+    headerButton(BROWSE, "Browse", panel == Panel::Browse);
     headerButton(QUEUE, "Queue", panel == Panel::Queue);
     headerButton(FAV, "Favorites", panel == Panel::Favs);
 
@@ -477,6 +607,8 @@ void drawMain(M5Canvas& c) {
                 if (fill > 0) c.fillRoundRect(tx, y, fill, 10, 5, COL_ACCENT);
             }
         }
+    } else if (panel == Panel::Browse) {
+        drawBrowse(c);
     } else {
         c.setFont(&fontUi);
         const char* heading = "Sonos favorites";
@@ -583,13 +715,19 @@ void maybeDecode() {
 
 void onTap(int x, int y) {
     if (!net::connected()) return;
-    if (QUEUE.contains(x, y) || FAV.contains(x, y)) {
-        Panel next = QUEUE.contains(x, y) ? Panel::Queue : Panel::Favs;
+    if (BROWSE.contains(x, y) || QUEUE.contains(x, y) || FAV.contains(x, y)) {
+        Panel next = Panel::Favs;
+        if (BROWSE.contains(x, y)) next = Panel::Browse;
+        else if (QUEUE.contains(x, y)) next = Panel::Queue;
         if (panel == next) panel = Panel::Closed;
         else {
             panel = next;
             favScroll = 0;
-            sonos::command(next == Panel::Queue ? sonos::Cmd::LoadQueue : sonos::Cmd::LoadFavorites, 0, nullptr);
+            browseScroll = 0;
+            keyboard = false;
+            if (next == Panel::Queue) sonos::command(sonos::Cmd::LoadQueue, 0, nullptr);
+            else if (next == Panel::Favs) sonos::command(sonos::Cmd::LoadFavorites, 0, nullptr);
+            else svc::requestPlaylists(0);
         }
         return;
     }
@@ -616,7 +754,63 @@ void onTap(int x, int y) {
         if (idx >= 0) sonos::command(sonos::Cmd::ToggleRoom, 0, view.rooms[idx].uuid);
         return;
     }
-    if (panel != Panel::Closed && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_LIST && y < FAV_B && !view.loadingFavs) {
+    if (panel == Panel::Browse && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_Y && y < FAV_B) {
+        char key = keyAt(x, y);
+        if (key == '\b') {
+            size_t n = strlen(query);
+            if (n) query[n - 1] = 0;
+        } else if (key == '\n') {
+            keyboard = false;
+            browseScroll = 0;
+            if (query[0]) svc::requestSearch(query, 0);
+        } else if (key == ' ') {
+            size_t n = strlen(query);
+            if (n + 1 < sizeof(query)) {
+                query[n] = ' ';
+                query[n + 1] = 0;
+            }
+        } else if (key) {
+            size_t n = strlen(query);
+            if (n + 1 < sizeof(query)) {
+                query[n] = key;
+                query[n + 1] = 0;
+            }
+            return;
+        }
+        if (key) return;
+        if (x >= FAV_X + 200 && x < FAV_X + 420 && y >= FAV_Y && y < FAV_Y + 44) {
+            query[0] = 0;
+            keyboard = false;
+            browseScroll = 0;
+            svc::requestPlaylists(0);
+            return;
+        }
+        if (y >= FAV_Y + 52 && y < FAV_Y + 92) {
+            keyboard = !keyboard;
+            return;
+        }
+        int listTop = FAV_Y + 100;
+        int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
+        if (y >= listTop && y < listBottom && !browse.loading) {
+            int idx = (y - listTop + browseScroll) / FAV_H;
+            if (idx == browse.count && (browse.more || browse.offset > 0)) {
+                bool back = x < FAV_X + FAV_W / 2 && browse.offset > 0;
+                int next = browse.offset + (back ? -10 : 10);
+                if (next < 0) next = 0;
+                browseScroll = 0;
+                if (query[0]) svc::requestSearch(query, next);
+                else svc::requestPlaylists(next);
+                return;
+            }
+            if (idx >= 0 && idx < browse.count) {
+                bool plus = x >= FAV_X + FAV_W - 64;
+                svc::requestPlay(idx, plus);
+                if (!plus && browse.items[idx].kind != svc::Kind::Artist) panel = Panel::Closed;
+            }
+        }
+        return;
+    }
+    if ((panel == Panel::Queue || panel == Panel::Favs) && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_LIST && y < FAV_B && !view.loadingFavs) {
         int idx = (y - FAV_LIST + favScroll) / FAV_H;
         if (idx >= 0 && idx < view.favCount) {
             sonos::command(sonos::Cmd::PlayFavorite, idx, nullptr);
@@ -637,7 +831,16 @@ void beginGesture(int x, int y) {
         sendVolume(vol, true);
         return;
     }
-    if (panel != Panel::Closed && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_LIST && y < FAV_B) {
+    if (panel == Panel::Browse && keyboard && keyAt(x, y)) {
+        drag = Drag::None;
+        return;
+    }
+    if (panel == Panel::Browse && x >= FAV_X && y >= FAV_Y + 100 && y < (keyboard ? KEY_Y : FAV_B)) {
+        drag = Drag::Favs;
+        scroll0 = browseScroll;
+        return;
+    }
+    if ((panel == Panel::Queue || panel == Panel::Favs) && x >= FAV_X && x < FAV_X + FAV_W && y >= FAV_LIST && y < FAV_B) {
         drag = Drag::Favs;
         scroll0 = favScroll;
         return;
@@ -670,10 +873,20 @@ void moveGesture(int x, int y) {
         if (roomScroll < 0) roomScroll = 0;
         if (roomScroll > maxS) roomScroll = maxS;
     } else if (drag == Drag::Favs) {
-        int maxS = listMax(view.favCount, FAV_B - FAV_LIST, FAV_H);
-        favScroll = scroll0 - (y - y0);
-        if (favScroll < 0) favScroll = 0;
-        if (favScroll > maxS) favScroll = maxS;
+        if (panel == Panel::Browse) {
+            int listTop = FAV_Y + 100;
+            int listBottom = keyboard ? KEY_Y - 8 : FAV_B;
+            int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
+            int maxS = listMax(rows, listBottom - listTop, FAV_H);
+            browseScroll = scroll0 - (y - y0);
+            if (browseScroll < 0) browseScroll = 0;
+            if (browseScroll > maxS) browseScroll = maxS;
+        } else {
+            int maxS = listMax(view.favCount, FAV_B - FAV_LIST, FAV_H);
+            favScroll = scroll0 - (y - y0);
+            if (favScroll < 0) favScroll = 0;
+            if (favScroll > maxS) favScroll = maxS;
+        }
     }
     lastY = y;
 }
@@ -737,6 +950,7 @@ void loop() {
     }
 
     sonos::copyView(view);
+    svc::copyView(browse);
     layoutRooms();
     char selected[40] = "";
     for (int i = 0; i < view.roomCount; i++)

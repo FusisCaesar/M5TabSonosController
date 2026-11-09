@@ -137,6 +137,7 @@ char lastMediaUri[320] = "";
 char lastMediaCount[8] = "";
 char lastListHead[72] = "";
 char lastErr[48] = "";
+int spotifySn = 0;
 
 void* ps(size_t n) {
     void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1166,6 +1167,11 @@ bool getPosition(const char* ip) {
         if (trackUri[0]) Serial.printf("[sonos] source %s\n", source[0] ? source : "Sonos");
         strlcpy(lastTitle, title, sizeof(lastTitle));
     }
+    if (trackUri[0] && strstr(trackUri, "spotify")) {
+        const char* sn = strstr(trackUri, "sn=");
+        int n = sn ? atoi(sn + 3) : 0;
+        if (n > 0) spotifySn = n;
+    }
     const char* shownSource = title[0] ? source : "";
     if (strcmp(shownSource, published.source) != 0 && (shownSource[0] || published.source[0])) {
         lock();
@@ -1804,6 +1810,84 @@ bool buildServiceDidl(const char* playUri, const char* title, const char* stored
     return didlBuf[0] != 0;
 }
 
+// Append uri, then optionally jump to it and start it. Trims older entries only
+// after the new one is actually playing, so the running stream is not cut first.
+bool queueAndPlay(Room* c, const char* uri, const char* meta, bool playNow) {
+    if (!c || !uri || !uri[0]) return false;
+    char pos[8];
+    strlcpy(pos, "1", sizeof(pos));
+    char queueUri[96];
+    snprintf(queueUri, sizeof(queueUri), "x-rincon-queue:%s#0", c->uuid);
+    auto seekPos = [&]() {
+        bool sought = invoke(c->ip, AVT_PATH, AVT, "Seek", [&] {
+            el("InstanceID", "0");
+            el("Unit", "TRACK_NR");
+            el("Target", pos);
+        });
+        Serial.printf("[sonos] seek %s %d\n", pos, sought);
+        return sought;
+    };
+    bool onQueue = false;
+    if (avt(c->ip, "GetMediaInfo")) {
+        char cur[160];
+        copyTag(resp, "CurrentURI", cur, sizeof(cur));
+        onQueue = !strncmp(cur, "x-rincon-queue:", 15);
+    }
+    bool added = addQueue(c->ip, uri, meta);
+    Serial.printf("[sonos] queue add %d onQueue %d uri %.180s\n", added, onQueue, uri);
+    if (!added) return false;
+    looseTag(resp, "FirstTrackNumberEnqueued", pos, sizeof(pos));
+    if (!pos[0]) strlcpy(pos, "1", sizeof(pos));
+    int firstNew = atoi(pos);
+    if (firstNew < 1) firstNew = 1;
+    if (!playNow) {
+        setStatus("Added to the queue");
+        return true;
+    }
+    bool opened = onQueue ? true : setUri(c->ip, queueUri, "");
+    Serial.printf("[sonos] first track %d, on queue %d\n", firstNew, opened);
+    if (opened) seekPos();
+    bool started = false;
+    if (opened) {
+        for (int attempt = 0; attempt < 3 && !started; attempt++) {
+            if (attempt) delay(200);
+            started = avt(c->ip, "Play");
+        }
+    }
+    if (!started) return false;
+    for (int k = 0; k < 6; k++) {
+        delay(1800);
+        char st[32] = "";
+        transportState(c->ip, st, sizeof(st));
+        bool playingNow = !strcmp(st, "PLAYING");
+        bool busy = !strcmp(st, "TRANSITIONING");
+        if (!playingNow && !busy && k < 5) {
+            if (k >= 2) setUri(c->ip, queueUri, "");
+            seekPos();
+            bool again = avt(c->ip, "Play");
+            Serial.printf("[sonos] %s after play (step %d), playing again %d\n", st[0] ? st : "?", k, again);
+        }
+        if (playingNow && firstNew > 1) {
+            char cnt[8];
+            snprintf(cnt, sizeof(cnt), "%d", firstNew - 1);
+            bool trimmed = invoke(c->ip, AVT_PATH, AVT, "RemoveTrackRangeFromQueue", [&] {
+                el("InstanceID", "0");
+                el("UpdateID", "0");
+                el("StartingIndex", "1");
+                el("NumberOfTracks", cnt);
+            });
+            Serial.printf("[sonos] removed %s older tracks %d\n", cnt, trimmed);
+            break;
+        }
+        if (playingNow || busy) break;
+    }
+    lock();
+    published.playing = true;
+    unlock();
+    lastPoll = 0;
+    return true;
+}
+
 void playFavorite(int index) {
     if (index < 0 || index >= favCount) return;
     Room* c = transportRoom();
@@ -1858,42 +1942,16 @@ void playFavorite(int index) {
     // household, but takes it in the queue. Songs go through the queue too.
     bool viaQueue = oneSong || container;
     if (container) meta = stored;
-    char pos[8];
-    strlcpy(pos, "1", sizeof(pos));
-    char queueUri[96];
-    snprintf(queueUri, sizeof(queueUri), "x-rincon-queue:%s#0", c->uuid);
-    auto seekPos = [&]() {
-        bool sought = invoke(c->ip, AVT_PATH, AVT, "Seek", [&] {
-            el("InstanceID", "0");
-            el("Unit", "TRACK_NR");
-            el("Target", pos);
-        });
-        Serial.printf("[sonos] seek %s %d\n", pos, sought);
-        return sought;
-    };
-    int firstNew = 1;
     if (viaQueue) {
-        // Append, then jump to it. The stream that is playing is not torn down first.
-        bool onQueue = false;
-        if (avt(c->ip, "GetMediaInfo")) {
-            char cur[160];
-            copyTag(resp, "CurrentURI", cur, sizeof(cur));
-            onQueue = !strncmp(cur, "x-rincon-queue:", 15);
+        if (!queueAndPlay(c, raw, meta, true)) {
+            char msg[72];
+            snprintf(msg, sizeof(msg), "%s", lastErr[0] ? lastErr : "Could not start that favorite");
+            setStatus(msg);
         }
-        bool added = addQueue(c->ip, raw, meta);
-        Serial.printf("[sonos] queue add %d onQueue %d: %.260s\n", added, onQueue, resp);
-        if (added) {
-            looseTag(resp, "FirstTrackNumberEnqueued", pos, sizeof(pos));
-            if (!pos[0]) strlcpy(pos, "1", sizeof(pos));
-            firstNew = atoi(pos);
-            if (firstNew < 1) firstNew = 1;
-            opened = onQueue ? true : setUri(c->ip, queueUri, "");
-            Serial.printf("[sonos] first track %d, on queue %d\n", firstNew, opened);
-            if (opened) seekPos();
-        }
-    } else {
-        opened = setUri(c->ip, uri, meta);
+        lastPoll = 0;
+        return;
     }
+    opened = setUri(c->ip, uri, meta);
     bool started = false;
     if (opened) {
         for (int attempt = 0; attempt < 3 && !started; attempt++) {
@@ -1910,27 +1968,11 @@ void playFavorite(int index) {
             transportState(c->ip, st, sizeof(st));
             bool playingNow = !strcmp(st, "PLAYING");
             bool busy = !strcmp(st, "TRANSITIONING");
-            // Radio sits in TRANSITIONING while it buffers. A queued song must reach PLAYING.
-            bool going = playingNow || (busy && !viaQueue);
-            if (!going && !busy && k < 5) {
-                // After STOPPED the speaker forgets which queue entry was meant, so a bare Play
-                // starts the wrong one. Always go back to the new entry first.
-                if (viaQueue && k >= 2) setUri(c->ip, queueUri, "");
-                if (viaQueue) seekPos();
+            // A station sits in TRANSITIONING while it buffers.
+            bool going = playingNow || busy;
+            if (!going && k < 5) {
                 bool again = avt(c->ip, "Play");
                 Serial.printf("[sonos] %s after play (step %d), playing again %d\n", st[0] ? st : "?", k, again);
-            }
-            if (going && viaQueue && firstNew > 1) {
-                // Only now drop what was queued before, so the playing stream is never interrupted.
-                char cnt[8];
-                snprintf(cnt, sizeof(cnt), "%d", firstNew - 1);
-                bool trimmed = invoke(c->ip, AVT_PATH, AVT, "RemoveTrackRangeFromQueue", [&] {
-                    el("InstanceID", "0");
-                    el("UpdateID", "0");
-                    el("StartingIndex", "1");
-                    el("NumberOfTracks", cnt);
-                });
-                Serial.printf("[sonos] removed %s older tracks %d\n", cnt, trimmed);
             }
             if (avt(c->ip, "GetPositionInfo")) {
                 char tr[8], du[16], re[16], tu[260], tt[80];
@@ -2139,6 +2181,17 @@ void drain() {
 }
 
 }  // namespace
+
+bool enqueue(const char* uri, const char* meta, bool playNow) {
+    Room* c = transportRoom();
+    if (!c) {
+        setStatus("No room selected");
+        return false;
+    }
+    return queueAndPlay(c, uri, meta, playNow);
+}
+
+int spotifyAccount() { return spotifySn; }
 
 void begin() {
     memset(&published, 0, sizeof(published));

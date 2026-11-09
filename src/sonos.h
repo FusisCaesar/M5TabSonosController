@@ -52,6 +52,11 @@ struct View {
 void begin();
 void loop();
 void command(Cmd cmd, int value, const char* text);
+// Network task only. Adds a service item to the selected room's queue.
+// playNow jumps to it and starts it. Returns false when the speaker rejects the item.
+bool enqueue(const char* uri, const char* meta, bool playNow);
+// Account number Sonos appended to a Spotify address it was already playing, or 0.
+int spotifyAccount();
 void copyView(View& out);
 // Copies the latest album-art JPEG into dst. Returns the byte count.
 size_t copyArt(uint8_t* dst, size_t cap, int* gen);
