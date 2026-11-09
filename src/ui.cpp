@@ -6,6 +6,7 @@
 #include "net.h"
 #include "services.h"
 #include "sonos.h"
+#include "youtube.h"
 
 #include <esp_heap_caps.h>
 #include <stdio.h>
@@ -48,6 +49,7 @@ constexpr Box VOL{828, 612, 428, 84};
 constexpr Box BROWSE{700, 18, 156, 72};
 constexpr Box QUEUE{868, 18, 150, 72};
 constexpr Box FAV{1030, 18, 234, 72};
+constexpr Box STAR_NOW{1164, 130, 92, 92};  // star button beside the title while YouTube plays
 
 M5Canvas canvas;
 M5Canvas art;
@@ -59,6 +61,9 @@ int shownGen = -1;
 enum class Panel : uint8_t { Closed, Queue, Favs, Browse };
 Panel panel = Panel::Closed;
 svc::View browse;
+yt::View tube;
+bool youtube = false;
+bool ytStars = false;  // YouTube mode shows the starred list instead of search results
 bool keyboard = false;
 char query[64] = "";
 int browseScroll = 0;
@@ -214,6 +219,7 @@ uint16_t sourceColor(M5Canvas& c, const char* name) {
     if (!strcmp(name, "Line-in")) return c.color565(190, 190, 190);
     if (!strcmp(name, "AirPlay")) return c.color565(170, 170, 180);
     if (!strcmp(name, "Library")) return c.color565(80, 170, 130);
+    if (!strcmp(name, "YouTube")) return c.color565(255, 48, 48);
     return COL_ACCENT;
 }
 
@@ -238,6 +244,8 @@ void drawSource(M5Canvas& c, int x, int y, const char* name) {
         c.drawCircle(cx, cy, 13, ink);
     } else if (!strcmp(name, "TV")) {
         c.fillRoundRect(cx - 12, cy - 8, 24, 16, 2, ink);
+    } else if (!strcmp(name, "YouTube")) {
+        c.fillTriangle(cx - 6, cy - 9, cx - 6, cy + 9, cx + 10, cy, ink);
     } else if (!strcmp(name, "AirPlay")) {
         c.fillTriangle(cx, cy - 10, cx - 10, cy + 8, cx + 10, cy + 8, ink);
     } else {
@@ -356,6 +364,39 @@ void drawMark(M5Canvas& c, int x, int y, int w, int h, bool play, bool hot) {
     c.setTextDatum(TL_DATUM);
 }
 
+void drawStarShape(M5Canvas& c, int cx, int cy, int r, uint16_t col, bool filled) {
+    int px[10], py[10];
+    for (int k = 0; k < 10; k++) {
+        float a = (-90.0f + 36.0f * k) * 0.0174533f;
+        float rad = (k % 2 == 0) ? (float)r : r * 0.42f;
+        px[k] = cx + (int)lroundf(cosf(a) * rad);
+        py[k] = cy + (int)lroundf(sinf(a) * rad);
+    }
+    for (int k = 0; k < 10; k++) {
+        int n = (k + 1) % 10;
+        if (filled) c.fillTriangle(cx, cy, px[k], py[k], px[n], py[n], col);
+        else c.drawLine(px[k], py[k], px[n], py[n], col);
+    }
+}
+
+void drawStarMark(M5Canvas& c, int x, int y, int w, int h, bool on, bool hot) {
+    c.fillRoundRect(x, y, w, h, 12, hot ? COL_ACCENT : COL_CARD2);
+    uint16_t ink = hot ? COL_BG : (on ? COL_ACCENT : COL_TEXT);
+    int r = (h < w ? h : w) / 2 - 8;
+    drawStarShape(c, x + w / 2, y + h / 2 + 1, r, ink, on);
+}
+
+bool isStarred(const char* id) {
+    for (int i = 0; i < tube.starCount; i++)
+        if (!strcmp(tube.stars[i].id, id)) return true;
+    return false;
+}
+
+// The speaker is playing something the Tab5 resolved from YouTube.
+bool youtubeNow() { return !strcmp(view.source, "YouTube") && tube.playingId[0]; }
+
+int tubeRows() { return ytStars ? tube.starCount : tube.count + (tube.more ? 1 : 0); }
+
 constexpr int BR_X = 16;
 constexpr int BR_W = 1248;
 constexpr int BR_TOP = 116;
@@ -376,9 +417,26 @@ bool clearHit(int x, int y) {
     return x >= clearX() && x < clearX() + BR_CLEAR && y >= clearY() && y < clearY() + BR_CLEAR;
 }
 
+constexpr int CHIP_W = 200;
+
+int youtubeChipX() { return BR_X + CHIP_W + 16; }
+int listsX() { return BR_X + 2 * (CHIP_W + 16); }
+
 int browseListTop() {
-    if (!keyboard && browse.status[0] && browse.count > 0) return BR_LIST + 56;
+    if (youtube && ytStars) return BR_LIST;
+    bool show = youtube ? (tube.status[0] && tube.count > 0) : (browse.status[0] && browse.count > 0);
+    if (!keyboard && show) return BR_LIST + 56;
     return BR_LIST;
+}
+
+void sourceChip(M5Canvas& c, int x, const char* label, bool on) {
+    bool hot = pressing && !moved && x0 >= x && x0 < x + CHIP_W && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+    c.fillRoundRect(x, BR_TOP, CHIP_W, BR_BTN_H, 12, (on || hot) ? COL_ACCENT : COL_CARD);
+    c.setFont(&fontBrowse);
+    c.setTextDatum(MC_DATUM);
+    c.setTextColor((on || hot) ? COL_BG : COL_TEXT);
+    c.drawString(label, x + CHIP_W / 2, BR_TOP + BR_BTN_H / 2);
+    c.setTextDatum(TL_DATUM);
 }
 
 char keyAt(int x, int y) {
@@ -439,13 +497,182 @@ void drawKeyboard(M5Canvas& c) {
     c.clearClipRect();
 }
 
+constexpr int THUMB_W = 160;
+constexpr int THUMB_H = 90;
+struct StarThumb {
+    char id[16];
+    M5Canvas* sprite;  // null when the picture could not be decoded
+    bool used;
+};
+StarThumb starThumbs[yt::MAX_STARS];
+
+StarThumb* thumbFor(const char* id) {
+    for (StarThumb& t : starThumbs)
+        if (t.used && !strcmp(t.id, id)) return &t;
+    return nullptr;
+}
+
+// Decodes at most one new thumbnail per frame and frees pictures of videos that are no longer starred.
+void updateStarThumbs() {
+    for (StarThumb& t : starThumbs) {
+        if (!t.used) continue;
+        bool keep = false;
+        for (int i = 0; i < tube.starCount; i++)
+            if (!strcmp(tube.stars[i].id, t.id)) keep = true;
+        if (keep) continue;
+        if (t.sprite) {
+            t.sprite->deleteSprite();
+            delete t.sprite;
+        }
+        t = StarThumb{};
+    }
+    if (!jpg || !youtube || !ytStars || panel != Panel::Browse) return;
+    for (int i = 0; i < tube.starCount; i++) {
+        if (!tube.starThumb[i] || thumbFor(tube.stars[i].id)) continue;
+        StarThumb* slot = nullptr;
+        for (StarThumb& t : starThumbs)
+            if (!t.used) {
+                slot = &t;
+                break;
+            }
+        if (!slot) return;
+        size_t n = yt::copyThumb(tube.stars[i].id, jpg, JPG_CAP);
+        slot->used = true;
+        strlcpy(slot->id, tube.stars[i].id, sizeof(slot->id));
+        slot->sprite = nullptr;
+        if (!n) return;
+        M5Canvas* sp = new M5Canvas();
+        sp->setColorDepth(16);
+        sp->setPsram(true);
+        sp->createSprite(THUMB_W, THUMB_H);
+        if (sp->getBuffer()) {
+            sp->fillSprite(COL_CARD2);
+            auto fit = lgfx::v1::textdatum::middle_center;
+            if (sp->drawJpg(jpg, n, 0, 0, THUMB_W, THUMB_H, 0, 0, 0.0f, 0.0f, fit)) slot->sprite = sp;
+        }
+        if (!slot->sprite) {
+            sp->deleteSprite();
+            delete sp;
+            Serial.printf("[ui] thumbnail decode failed (%u bytes)\n", (unsigned)n);
+        }
+        return;
+    }
+}
+
+void drawStarList(M5Canvas& c) {
+    int listTop = BR_LIST;
+    int listBottom = BR_SAFE;
+    int rows = tube.starCount;
+    int viewH = listBottom - listTop;
+    int maxS = listMax(rows, viewH, BR_H);
+    if (browseScroll > maxS) browseScroll = maxS;
+    if (browseScroll < 0) browseScroll = 0;
+    c.setClipRect(BR_X, listTop, BR_W, viewH);
+    if (rows == 0) {
+        c.setFont(&fontBrowse);
+        text(c, "No starred videos yet. Tap the star on a result or on the playing video.", BR_X, listTop + 8, BR_W,
+             COL_MUTED);
+    }
+    for (int i = 0; i < rows; i++) {
+        int y = listTop + i * BR_H - browseScroll;
+        if (y + BR_H < listTop || y > listBottom) continue;
+        const int gutter = 176;
+        c.fillRoundRect(BR_X, y + 4, BR_W - gutter, BR_H - 8, 14, COL_CARD);
+        int tx = BR_X + 12;
+        StarThumb* th = thumbFor(tube.stars[i].id);
+        if (th && th->sprite) th->sprite->pushSprite(&c, tx, y + 14);
+        else c.fillRoundRect(tx, y + 14, THUMB_W, THUMB_H, 8, COL_CARD2);
+        int textX = tx + THUMB_W + 20;
+        int textW = BR_W - gutter - (textX - BR_X) - 16;
+        c.setFont(&fontBrowse);
+        text(c, tube.stars[i].title, textX, y + 12, textW, COL_TEXT);
+        c.setFont(&fontBrowseBody);
+        text(c, tube.stars[i].channel, textX, y + 62, textW, COL_MUTED);
+        int starX = BR_X + BR_W - 156;
+        int markX = BR_X + BR_W - 80;
+        bool starHot = pressing && !moved && x0 >= starX && x0 < starX + 68 && y0 >= y + 24 && y0 < y + 94;
+        bool playHot = pressing && !moved && x0 >= markX && x0 < markX + 68 && y0 >= y + 24 && y0 < y + 94;
+        drawStarMark(c, starX, y + 26, 68, 66, true, starHot);
+        drawMark(c, markX, y + 26, 68, 66, true, playHot);
+    }
+    c.clearClipRect();
+}
+
+void drawTube(M5Canvas& c) {
+    if (ytStars) {
+        drawStarList(c);
+        return;
+    }
+    int listTop = browseListTop();
+    int listBottom = BR_SAFE;
+    c.setFont(&fontBrowse);
+    if (tube.status[0]) text(c, tube.status, BR_X, BR_LIST, BR_W, COL_MUTED);
+    int rows = tube.count + (tube.more ? 1 : 0);
+    int viewH = listBottom - listTop;
+    int maxS = listMax(rows, viewH, BR_H);
+    if (browseScroll > maxS) browseScroll = maxS;
+    if (browseScroll < 0) browseScroll = 0;
+    c.setClipRect(BR_X, listTop, BR_W, viewH);
+    if (tube.loading && tube.count == 0) {
+        text(c, "Searching YouTube...", BR_X, listTop + 8, BR_W, COL_MUTED);
+    } else if (!tube.loading && tube.count == 0 && !tube.status[0]) {
+        text(c, "Search YouTube, then tap Search", BR_X, listTop + 8, BR_W, COL_MUTED);
+    }
+    for (int i = 0; i < tube.count; i++) {
+        int y = listTop + i * BR_H - browseScroll;
+        if (y + BR_H < listTop || y > listBottom) continue;
+        int gutter = 176;
+        c.fillRoundRect(BR_X, y + 4, BR_W - gutter, BR_H - 8, 14, COL_CARD);
+        c.setFont(&fontBrowse);
+        text(c, tube.items[i].title, BR_X + 20, y + 8, BR_W - gutter - 36, COL_TEXT);
+        char clock[16] = "";
+        int seconds = tube.items[i].seconds;
+        if (seconds > 0) {
+            if (seconds >= 3600)
+                snprintf(clock, sizeof(clock), "%d:%02d:%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+            else
+                snprintf(clock, sizeof(clock), "%d:%02d", seconds / 60, seconds % 60);
+        }
+        char line[100];
+        snprintf(line, sizeof(line), "%s%s%s", tube.items[i].channel, clock[0] ? "  " : "", clock);
+        c.setFont(&fontBrowseBody);
+        text(c, line, BR_X + 20, y + 62, BR_W - gutter - 36, COL_MUTED);
+        int markX = BR_X + BR_W - 80;
+        bool playHot = pressing && !moved && x0 >= markX && x0 < markX + 68 && y0 >= y + 24 && y0 < y + 94;
+        drawMark(c, markX, y + 26, 68, 66, true, playHot);
+        int starX = BR_X + BR_W - 156;
+        bool starHot = pressing && !moved && x0 >= starX && x0 < starX + 68 && y0 >= y + 24 && y0 < y + 94;
+        drawStarMark(c, starX, y + 26, 68, 66, isStarred(tube.items[i].id), starHot);
+    }
+    if (tube.more) {
+        int y = listTop + tube.count * BR_H - browseScroll;
+        if (y + BR_H >= listTop && y <= listBottom) {
+            c.setFont(&fontBrowse);
+            text(c, "More", BR_X + 20, y + 32, BR_W, COL_ACCENT);
+        }
+    }
+    c.clearClipRect();
+}
+
 void drawBrowse(M5Canvas& c) {
     c.fillRect(0, 109, c.width(), BR_SAFE - 109, COL_BG);
     c.setFont(&fontBrowse);
-    bool queuePage = browse.pagePlayable && canQueue(browse.pageKind);
+    bool queuePage = !youtube && browse.pagePlayable && canQueue(browse.pageKind);
     int playX = BR_X + BR_W - 16 - 64;
     if (queuePage) playX -= 76;
-    if (browse.canBack) {
+    if (youtube || !browse.canBack) {
+        sourceChip(c, BR_X, "Spotify", !youtube);
+        sourceChip(c, youtubeChipX(), "YouTube", youtube && !ytStars);
+        if (youtube) sourceChip(c, listsX(), "Starred", ytStars);
+        if (!youtube) {
+            bool lists = pressing && !moved && x0 >= listsX() && x0 < listsX() + 320 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
+            c.fillRoundRect(listsX(), BR_TOP, 320, BR_BTN_H, 12, lists ? COL_ACCENT : COL_CARD);
+            c.setTextDatum(MC_DATUM);
+            c.setTextColor(lists ? COL_BG : COL_TEXT);
+            c.drawString("My playlists", listsX() + 160, BR_TOP + BR_BTN_H / 2);
+            c.setTextDatum(TL_DATUM);
+        }
+    } else if (browse.canBack) {
         bool hot = pressing && !moved && x0 >= BR_X && x0 < BR_X + 160 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
         c.fillRoundRect(BR_X, BR_TOP, 160, BR_BTN_H, 12, hot ? COL_ACCENT : COL_CARD);
         c.setTextDatum(MC_DATUM);
@@ -455,16 +682,8 @@ void drawBrowse(M5Canvas& c) {
         int titleW = (browse.pagePlayable ? playX : BR_X + BR_W) - (BR_X + 176) - 12;
         if (titleW < 40) titleW = 40;
         text(c, browse.heading[0] ? browse.heading : "Spotify", BR_X + 176, BR_TOP, titleW, COL_TEXT);
-    } else {
-        text(c, svc::providerName(), BR_X, BR_TOP + 4, 220, COL_ACCENT);
-        bool lists = pressing && !moved && x0 >= BR_X + 240 && x0 < BR_X + 580 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
-        c.fillRoundRect(BR_X + 240, BR_TOP, 340, BR_BTN_H, 12, lists ? COL_ACCENT : COL_CARD);
-        c.setTextDatum(MC_DATUM);
-        c.setTextColor(lists ? COL_BG : COL_TEXT);
-        c.drawString("My playlists", BR_X + 410, BR_TOP + BR_BTN_H / 2);
-        c.setTextDatum(TL_DATUM);
     }
-    if (browse.pagePlayable) {
+    if (!youtube && browse.pagePlayable) {
         bool hot = pressing && !moved && x0 >= playX && x0 < playX + 64 && y0 >= BR_TOP && y0 < BR_TOP + BR_BTN_H;
         drawMark(c, playX, BR_TOP, 64, BR_BTN_H, true, hot);
         if (queuePage) {
@@ -479,7 +698,7 @@ void drawBrowse(M5Canvas& c) {
     c.setTextColor(query[0] ? COL_TEXT : COL_MUTED);
     int textY = BR_SEARCH_Y + (BR_SEARCH_H - c.fontHeight()) / 2;
     c.setClipRect(BR_X + 24, BR_SEARCH_Y + 4, clearX() - BR_X - 48, BR_SEARCH_H - 8);
-    c.drawString(query[0] ? query : "Search Spotify", BR_X + 24, textY);
+    c.drawString(query[0] ? query : (youtube ? "Search YouTube" : "Search Spotify"), BR_X + 24, textY);
     c.clearClipRect();
     bool clearing = pressing && !moved && clearHit(x0, y0);
     c.fillRoundRect(clearX(), clearY(), BR_CLEAR, BR_CLEAR, 12, clearing ? COL_ACCENT : COL_CARD);
@@ -490,6 +709,10 @@ void drawBrowse(M5Canvas& c) {
 
     if (keyboard) {
         drawKeyboard(c);
+        return;
+    }
+    if (youtube) {
+        drawTube(c);
         return;
     }
 
@@ -666,6 +889,11 @@ void drawMain(M5Canvas& c) {
         int tx = ART_X + ART + 28;
         int tw = c.width() - tx - 24;
         bool haveTrack = view.title[0] != 0;
+        if (haveTrack && youtubeNow()) {
+            tw -= 108;
+            bool hot = pressing && !moved && STAR_NOW.contains(x0, y0);
+            drawStarMark(c, STAR_NOW.x, STAR_NOW.y, STAR_NOW.w, STAR_NOW.h, isStarred(tube.playingId), hot);
+        }
         int y = ART_Y;
         if (haveTrack && view.source[0]) {
             drawSource(c, tx, y, view.source);
@@ -826,8 +1054,12 @@ void onTap(int x, int y) {
             keyboard = false;
             if (next == Panel::Queue) sonos::command(sonos::Cmd::LoadQueue, 0, nullptr);
             else if (next == Panel::Favs) sonos::command(sonos::Cmd::LoadFavorites, 0, nullptr);
-            else if (!browse.canBack && browse.count == 0) svc::requestPlaylists(0);
+            else if (!youtube && !browse.canBack && browse.count == 0) svc::requestPlaylists(0);
         }
+        return;
+    }
+    if (panel == Panel::Closed && view.title[0] && youtubeNow() && STAR_NOW.contains(x, y)) {
+        yt::toggleStar(tube.playingId, tube.playingTitle, tube.playingChannel);
         return;
     }
     if (PREV.contains(x, y)) {
@@ -861,7 +1093,10 @@ void onTap(int x, int y) {
         } else if (key == '\n') {
             keyboard = false;
             browseScroll = 0;
-            if (query[0]) svc::requestSearch(query, 0);
+            if (query[0]) {
+                if (youtube) yt::requestSearch(query);
+                else svc::requestSearch(query, 0);
+            }
         } else if (key == ' ') {
             size_t n = strlen(query);
             if (n + 1 < sizeof(query)) {
@@ -881,20 +1116,41 @@ void onTap(int x, int y) {
             query[0] = 0;
             return;
         }
-        if (browse.canBack && x >= BR_X && x < BR_X + 160 && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
+        if ((youtube || !browse.canBack) && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
+            if (x >= BR_X && x < BR_X + CHIP_W) {
+                youtube = false;
+                keyboard = false;
+                browseScroll = 0;
+                return;
+            }
+            if (x >= youtubeChipX() && x < youtubeChipX() + CHIP_W) {
+                youtube = true;
+                ytStars = false;
+                keyboard = false;
+                browseScroll = 0;
+                return;
+            }
+            if (youtube && x >= listsX() && x < listsX() + CHIP_W) {
+                ytStars = true;
+                keyboard = false;
+                browseScroll = 0;
+                return;
+            }
+            if (!youtube && x >= listsX() && x < listsX() + 320) {
+                query[0] = 0;
+                keyboard = false;
+                browseScroll = 0;
+                svc::requestPlaylists(0);
+                return;
+            }
+        }
+        if (!youtube && browse.canBack && x >= BR_X && x < BR_X + 160 && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
             keyboard = false;
             browseScroll = 0;
             svc::requestBack();
             return;
         }
-        if (!browse.canBack && x >= BR_X + 240 && x < BR_X + 580 && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
-            query[0] = 0;
-            keyboard = false;
-            browseScroll = 0;
-            svc::requestPlaylists(0);
-            return;
-        }
-        if (browse.pagePlayable && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
+        if (!youtube && browse.pagePlayable && y >= BR_TOP && y < BR_TOP + BR_BTN_H) {
             bool queuePage = canQueue(browse.pageKind);
             int playX = BR_X + BR_W - 16 - 64;
             if (queuePage) playX -= 76;
@@ -909,11 +1165,47 @@ void onTap(int x, int y) {
             }
         }
         if (y >= BR_SEARCH_Y && y < BR_SEARCH_Y + BR_SEARCH_H) {
+            if (youtube && ytStars) {
+                ytStars = false;
+                browseScroll = 0;
+                keyboard = true;
+                return;
+            }
             keyboard = !keyboard;
             return;
         }
         if (keyboard) return;
         int listTop = browseListTop();
+        if (youtube) {
+            int listBottom = BR_SAFE;
+            bool onStar = x >= BR_X + BR_W - 164 && x < BR_X + BR_W - 84;
+            if (ytStars) {
+                if (y >= listTop && y < listBottom) {
+                    int idx = (y - listTop + browseScroll) / BR_H;
+                    if (idx >= 0 && idx < tube.starCount) {
+                        if (onStar) yt::toggleStar(tube.stars[idx].id, tube.stars[idx].title, tube.stars[idx].channel);
+                        else {
+                            yt::playStar(idx);
+                            panel = Panel::Closed;
+                        }
+                    }
+                }
+                return;
+            }
+            if (y >= listTop && y < listBottom && !tube.loading) {
+                int idx = (y - listTop + browseScroll) / BR_H;
+                if (idx == tube.count && tube.more) {
+                    browseScroll = 0;
+                    yt::requestMore();
+                    return;
+                }
+                if (idx >= 0 && idx < tube.count) {
+                    if (onStar) yt::toggleStar(tube.items[idx].id, tube.items[idx].title, tube.items[idx].channel);
+                    else yt::requestPlay(idx);
+                }
+            }
+            return;
+        }
         int listBottom = BR_SAFE;
         if (y >= listTop && y < listBottom && !browse.loading) {
             int idx = (y - listTop + browseScroll) / BR_H;
@@ -1011,7 +1303,8 @@ void moveGesture(int x, int y) {
         if (panel == Panel::Browse) {
             int listTop = browseListTop();
             int listBottom = BR_SAFE;
-            int rows = browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
+            int rows = youtube ? tubeRows()
+                               : browse.count + (browse.more || browse.offset > 0 ? 1 : 0);
             int maxS = listMax(rows, listBottom - listTop, BR_H);
             browseScroll = scroll0 - (y - y0);
             if (browseScroll < 0) browseScroll = 0;
@@ -1086,6 +1379,7 @@ void loop() {
 
     sonos::copyView(view);
     svc::copyView(browse);
+    yt::copyView(tube);
     layoutRooms();
     char selected[40] = "";
     for (int i = 0; i < view.roomCount; i++)
@@ -1110,6 +1404,7 @@ void loop() {
     if (t.wasReleased()) endGesture(t.x, t.y);
 
     if (net::connected()) maybeDecode();
+    if (net::connected()) updateStarThumbs();
     if (net::connected()) drawMain(canvas);
     else drawWifi(canvas);
     fb::push(canvas, 0, 0);

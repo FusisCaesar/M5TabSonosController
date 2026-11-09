@@ -292,6 +292,26 @@ Constraints that showed up on this board:
 - `BLEDevice::init` and `BLEClient::connect` block. Run them on their own task. Heart Rate Service `0x180D`, measurement `0x2A37`, worked against a chest strap and a Garmin watch broadcasting HR. A scan on this C6 found 25 devices. ANT+ is not available.
 - This Arduino build has TLS 1.2 only: `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3` is unset in the prebuilt ESP32-P4 libraries, while `CONFIG_MBEDTLS_SSL_PROTO_TLS1_2` and the full CA bundle are on. The chip and current ESP-IDF can do TLS 1.3, but this firmware cannot until those libraries are rebuilt with the option enabled. A host that offers only TLS 1.3 has to be fetched as plain HTTP, or not at all. Spotify and SoundCloud still accept TLS 1.2. Certificate checks were turned off for one HTTPS tile server that did work. A TLS-plus-decode task needed about 12 KB of stack here; the silent failure that looked like a stack overflow was a logic bug (each request issued twice). Measure high-water before growing the stack. Do not drop a TLS task to the default 2–4 KB without measuring.
 
+## YouTube
+
+Browse has a YouTube switch next to Spotify. Search uses the same keyboard. A row has a title, channel, length, and one play button. There is no plus and no drill-down. More asks YouTube for the next page. The address is resolved when you tap play, not when the list arrives, because those addresses expire.
+
+This is not a Sonos music service and there is no sign-in. The Tab5 posts to YouTube's own InnerTube player endpoint, picks a plain (no cipher) address, and then relays the audio itself. The speaker is given `http://<tab5>:8080/yt/N` and a second Tab5 task fetches the real `googlevideo.com` file in 256 KB closed ranges into a 6 MB PSRAM ring, up to 4 MB ahead of the speaker, and the relay serves the speaker from that ring. The buffer keeps audio going through a slow Wi-Fi moment or a search running at the same time. A direct address does not work: YouTube answers 403 to a fetch without a closed `Range`, and the Sonos never sends one, so the speaker stopped within seconds. The relay also answers the speaker's own `Range` requests (it reconnects every few seconds), and each new pick gets a new `N` that cuts off the previous stream.
+
+What was measured on 9 Nov 2026: itag 18 (combined 360p MP4) plays on the speaker through the relay. AAC itag 140 is DASH fragmented MP4 and the speaker drops it. The `ANDROID_VR` client gives itag 18 addresses that return 403 even with a range, so the firmware moves on to the `ANDROID` client, which works. HLS manifests are not used. Some videos come back `LOGIN_REQUIRED` ("Sign in to confirm you're not a bot") and will not play. Age-gated, region-locked, and live videos may not resolve. The relay needs the Tab5 to stay on and on the same network as the speaker. The five-minute seek has not been verified through the relay. YouTube can change this without notice. When it does, the fix is a serial command, not a reflash.
+
+Starred videos: every search row has a star, and the playing screen shows a star beside the title while YouTube plays. The **Starred** chip next to YouTube lists them, newest first, with thumbnails. Tap a row to play it, or its star to remove it. Up to 24 are kept in NVS (namespace `ytstar`) and survive a reboot. Thumbnails (`i.ytimg.com` `mqdefault.jpg`, over plain http) are downloaded on the network task when it is idle and decoded to 160x90 when the list is open.
+
+Serial, on the USB CDC port opened with DTR and RTS low:
+
+- `Y` plus a video id resolves and plays it on the selected room.
+- `Yq` plus words runs the same search the screen uses.
+- `Ys` seeks the speaker to five minutes.
+- `Yk` stars or unstars the video that is playing.
+- `Yc name|version|ua` stores one override client in NVS (namespace `yt`). It is tried first. Example: `Yc ANDROID_VR|1.65.10|com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip`
+
+The player response uses its own 512 KB PSRAM buffer. It does not share the Spotify one. Playback is checked about six seconds after the speaker starts. If it is not playing, the screen says the speaker refused the stream.
+
 ## GPS on Grove Port A
 
 Port A HY2.0-4P: black GND, red 5 V, yellow GPIO53, white GPIO54. The M5 GPS v1.1 (AT6668 / ATGM336H) is 115200 baud and 10 Hz capable. The older v1.0 (AT6558) is 9600. Grove cables are not consistent about which pin is TX.

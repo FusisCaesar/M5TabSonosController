@@ -55,6 +55,11 @@ void command(Cmd cmd, int value, const char* text);
 // Network task only. Adds a service item to the selected room's queue.
 // playNow jumps to it and starts it. Returns false when the speaker rejects the item.
 bool enqueue(const char* uri, const char* meta, bool playNow);
+// Network task only. Plays a direct http(s) audio address on the selected room.
+bool playDirect(const char* uri, const char* title);
+bool seekRel(const char* hms);
+// Name, channel and thumbnail address to show while the speaker plays the Tab5 relay. Network task only.
+void setDirectInfo(const char* title, const char* artist, const char* artUrl);
 // Account number Sonos appended to a Spotify address it was already playing, or 0.
 int spotifyAccount();
 void copyView(View& out);
