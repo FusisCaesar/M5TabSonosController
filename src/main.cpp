@@ -58,6 +58,11 @@ static void serialCommands() {
                 }
                 net::requestConnect(ssid, pass);
             }
+        } else if ((line[0] == 'P' || line[0] == 'p') && line[1] == 0) {
+            ui::requestShot();
+        } else if ((line[0] == 'U' || line[0] == 'u') && line[1] == ' ') {
+            int tx = 0, ty = 0;
+            if (sscanf(line + 2, "%d %d", &tx, &ty) == 2) ui::injectTap(tx, ty);
         } else if ((line[0] == 'F' || line[0] == 'f') && line[1] == 0) {
             net::requestForget();
         } else if ((line[0] == 'T' || line[0] == 't') && line[1] == 0) {

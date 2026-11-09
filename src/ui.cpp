@@ -1319,6 +1319,45 @@ void moveGesture(int x, int y) {
     lastY = y;
 }
 
+volatile bool shotPending = false;
+volatile bool tapPending = false;
+volatile int tapX = 0;
+volatile int tapY = 0;
+
+// Writes the finished frame to the USB serial port for README screenshots.
+void sendShot() {
+    const uint8_t* px = (const uint8_t*)canvas.getBuffer();
+    if (!px) return;
+    const size_t total = (size_t)canvas.width() * canvas.height() * 2;
+    Serial.setTxTimeoutMs(1000);
+    Serial.printf("\nSHOT %d %d\n", canvas.width(), canvas.height());
+    // Other tasks print log lines at any time. Each chunk goes out in one write with a header
+    // (A5 5A A5 5A, chunk index, length) so the receiver can skip anything between chunks.
+    constexpr size_t CHUNK = 2048;
+    static uint8_t packet[8 + CHUNK];
+    size_t sent = 0;
+    uint16_t index = 0;
+    while (sent < total) {
+        size_t n = total - sent < CHUNK ? total - sent : CHUNK;
+        packet[0] = 0xA5;
+        packet[1] = 0x5A;
+        packet[2] = 0xA5;
+        packet[3] = 0x5A;
+        packet[4] = index & 0xFF;
+        packet[5] = index >> 8;
+        packet[6] = n & 0xFF;
+        packet[7] = n >> 8;
+        memcpy(packet + 8, px + sent, n);
+        size_t w = Serial.write(packet, 8 + n);
+        if (w != 8 + n) break;
+        sent += n;
+        index++;
+    }
+    Serial.flush();
+    Serial.setTxTimeoutMs(0);
+    Serial.printf("\nSHOT end %u\n", (unsigned)sent);
+}
+
 void endGesture(int x, int y) {
     if (drag == Drag::Volume) sendVolume(localVol, true);
     else if (!moved) onTap(x, y);
@@ -1403,11 +1442,27 @@ void loop() {
     if (t.isPressed()) moveGesture(t.x, t.y);
     if (t.wasReleased()) endGesture(t.x, t.y);
 
+    if (tapPending) {
+        tapPending = false;
+        onTap(tapX, tapY);
+    }
     if (net::connected()) maybeDecode();
     if (net::connected()) updateStarThumbs();
     if (net::connected()) drawMain(canvas);
     else drawWifi(canvas);
+    if (shotPending) {
+        shotPending = false;
+        sendShot();
+    }
     fb::push(canvas, 0, 0);
+}
+
+void requestShot() { shotPending = true; }
+
+void injectTap(int x, int y) {
+    tapX = x;
+    tapY = y;
+    tapPending = true;
 }
 
 }  // namespace ui
