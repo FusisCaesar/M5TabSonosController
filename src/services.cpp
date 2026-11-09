@@ -18,7 +18,7 @@
 namespace svc {
 namespace {
 
-constexpr size_t HTTP_CAP = 48 * 1024;
+constexpr size_t HTTP_CAP = 128 * 1024;
 
 SemaphoreHandle_t mu = nullptr;
 char* httpBuf = nullptr;
@@ -33,10 +33,32 @@ bool wantProbe = false;
 bool wantSave = false;
 bool wantClear = false;
 bool wantList = false;
+bool wantReload = false;
+bool wantBack = false;
+bool wantPagePlay = false;
 char wantQuery[64] = "";
 int wantOffset = 0;
 int wantPlay = -1;
+bool wantOpen = false;
+Item wantOpenItem;
 bool wantAppend = false;
+
+enum class Page : uint8_t { Playlists, Search, Album, Playlist, Artist, Track };
+
+struct Crumb {
+    Page page;
+    Kind kind;
+    bool playable;
+    char id[48];
+    char title[72];
+    char query[64];
+    int offset;
+    int pageSize;
+};
+
+constexpr int MAX_DEPTH = 8;
+Crumb stack[MAX_DEPTH];
+int depth = 0;
 char saveId[48] = "";
 char saveRefresh[400] = "";
 char saveSecret[80] = "";
@@ -226,7 +248,7 @@ const char* firstArtist(JsonObject item) {
     return "";
 }
 
-bool spotifyGet(const char* url) {
+bool spotifyGet(const char* url, bool report = true) {
     if (!ensureAccess()) return false;
     char auth[460];
     snprintf(auth, sizeof(auth), "Bearer %s", access);
@@ -239,15 +261,15 @@ bool spotifyGet(const char* url) {
         code = https(url, "GET", "", "", auth);
     }
     if (code == 429) {
-        setStatus("Spotify is busy, try again");
+        if (report) setStatus("Spotify is busy, try again");
         return false;
     }
     if (code == 403) {
-        setStatus("Spotify will not open that");
+        if (report) setStatus("Spotify will not open that");
         return false;
     }
     if (code != 200) {
-        setStatus("Spotify did not answer");
+        if (report) setStatus("Spotify did not answer");
         return false;
     }
     return true;
@@ -281,6 +303,10 @@ void spotifyLoad(bool search, const char* query, int offset) {
     published.count = 0;
     published.offset = offset < 0 ? 0 : offset;
     published.more = false;
+    published.canBack = depth > 0;
+    published.pagePlayable = false;
+    published.pageKind = Kind::Track;
+    published.pageSize = 10;
     strlcpy(published.query, search ? (query ? query : "") : "", sizeof(published.query));
     strlcpy(published.heading, search ? "Search" : "My playlists", sizeof(published.heading));
     unlock();
@@ -333,6 +359,10 @@ void spotifyLoad(bool search, const char* query, int offset) {
     }
     published.loading = false;
     published.signedIn = true;
+    published.canBack = depth > 0;
+    published.pagePlayable = false;
+    published.pageKind = Kind::Track;
+    published.pageSize = 10;
     if (published.count == 0) strlcpy(published.status, search ? "No matches" : "No playlists", sizeof(published.status));
     else published.status[0] = 0;
     unlock();
@@ -342,6 +372,27 @@ void spotifyLoad(bool search, const char* query, int offset) {
 // Sonos addresses, from SoCo's ShareLink table. The fallback is the form this
 // household already plays from a saved favorite.
 bool spotifyDidl(const Item& item, char* uri, size_t uriCap, char* meta, size_t metaCap, bool favoriteForm) {
+    if (item.kind == Kind::Radio || item.kind == Kind::Artist) {
+        int sn = sonos::spotifyAccount();
+        if (sn < 1) sn = 1;
+        snprintf(uri, uriCap, "x-sonosapi-radio:spotify%%3aartistRadio%%3a%s?sid=9&flags=8300&sn=%d", item.id, sn);
+        char title[160];
+        xmlEscape(item.title[0] ? item.title : "Radio", title, sizeof(title));
+        char id[140];
+        snprintf(id, sizeof(id), "100c206cspotify%%3aartistRadio%%3a%s", item.id);
+        int wrote = snprintf(meta, metaCap,
+                             "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+                             "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" "
+                             "xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" "
+                             "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
+                             "<item id=\"%s\" parentID=\"-1\" restricted=\"true\">"
+                             "<dc:title>%s</dc:title>"
+                             "<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+                             "<desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">"
+                             "SA_RINCON2311_X_#Svc2311-0-Token</desc></item></DIDL-Lite>",
+                             id, title);
+        return wrote > 0 && (size_t)wrote < metaCap;
+    }
     const char* word = "track";
     const char* cls = "object.item.audioItem.musicTrack";
     const char* prefix = "";
@@ -396,11 +447,12 @@ bool spotifyDidl(const Item& item, char* uri, size_t uriCap, char* meta, size_t 
 }
 
 bool spotifyPlay(const Item& item, bool append) {
-    if (item.kind == Kind::Artist) {
-        char q[80];
-        snprintf(q, sizeof(q), "artist:\"%s\"", item.title);
-        spotifyLoad(true, q, 0);
-        return true;
+    if (item.kind == Kind::Artist || item.kind == Kind::Radio) {
+        char uri[320];
+        char meta[1200];
+        if (!spotifyDidl(item, uri, sizeof(uri), meta, sizeof(meta), false)) return false;
+        Serial.printf("[svc] radio %s\n", uri);
+        return sonos::enqueue(uri, meta, !append);
     }
     char uri[320];
     char meta[1200];
@@ -410,6 +462,273 @@ bool spotifyPlay(const Item& item, bool append) {
     Serial.println("[svc] share form rejected, trying favorite form");
     if (!spotifyDidl(item, uri, sizeof(uri), meta, sizeof(meta), true)) return false;
     return sonos::enqueue(uri, meta, !append);
+}
+
+void beginPage(const Crumb& c) {
+    lock();
+    published.loading = true;
+    published.count = 0;
+    published.offset = c.offset;
+    published.more = false;
+    published.pageSize = c.pageSize > 0 ? c.pageSize : 10;
+    published.canBack = depth > 0;
+    published.pagePlayable = c.playable;
+    published.pageKind = c.kind;
+    published.signedIn = true;
+    published.status[0] = 0;
+    const char* heading = c.title;
+    if (c.page == Page::Search) heading = "Search";
+    else if (c.page == Page::Playlists) heading = "My playlists";
+    strlcpy(published.heading, heading && heading[0] ? heading : "Spotify", sizeof(published.heading));
+    strlcpy(published.query, c.query, sizeof(published.query));
+    unlock();
+}
+
+void finishPage(bool empty, const char* emptyText) {
+    published.loading = false;
+    published.signedIn = true;
+    if (published.count == 0 && empty) strlcpy(published.status, emptyText, sizeof(published.status));
+}
+
+void loadAlbum(const Crumb& c) {
+    beginPage(c);
+    char url[180];
+    snprintf(url, sizeof(url), "https://api.spotify.com/v1/albums/%s/tracks?limit=20&offset=%d", c.id, c.offset);
+    if (!spotifyGet(url)) return;
+    JsonDocument filter;
+    filter["items"][0]["id"] = true;
+    filter["items"][0]["name"] = true;
+    filter["items"][0]["track_number"] = true;
+    filter["items"][0]["artists"][0]["name"] = true;
+    filter["next"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
+        setStatus("Could not read Spotify");
+        return;
+    }
+    lock();
+    for (JsonObject item : doc["items"].as<JsonArray>()) {
+        if (published.count >= MAX_ITEMS) break;
+        const char* id = item["id"] | "";
+        if (!id[0]) continue;
+        char sub[72];
+        snprintf(sub, sizeof(sub), "%d", item["track_number"] | (published.count + 1));
+        const char* artist = firstArtist(item);
+        if (artist && artist[0]) {
+            size_t n = strlen(sub);
+            snprintf(sub + n, sizeof(sub) - n, "  %s", artist);
+        }
+        addItem(Kind::Track, id, item["name"] | "", sub);
+    }
+    published.more = !doc["next"].isNull();
+    finishPage(true, "No tracks");
+    unlock();
+}
+
+void loadPlaylist(const Crumb& c) {
+    beginPage(c);
+    char url[280];
+    snprintf(url, sizeof(url),
+             "https://api.spotify.com/v1/playlists/%s/tracks?limit=20&offset=%d&fields=items(track(id,name,type,artists(name))),next",
+             c.id, c.offset);
+    if (!spotifyGet(url)) return;
+    JsonDocument filter;
+    filter["items"][0]["track"]["id"] = true;
+    filter["items"][0]["track"]["name"] = true;
+    filter["items"][0]["track"]["type"] = true;
+    filter["items"][0]["track"]["artists"][0]["name"] = true;
+    filter["next"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
+        setStatus("Could not read Spotify");
+        return;
+    }
+    lock();
+    for (JsonObject wrap : doc["items"].as<JsonArray>()) {
+        if (published.count >= MAX_ITEMS) break;
+        JsonObject item = wrap["track"];
+        if (item.isNull()) continue;
+        const char* type = item["type"] | "track";
+        if (strcmp(type, "track")) continue;
+        const char* id = item["id"] | "";
+        if (!id[0]) continue;
+        addItem(Kind::Track, id, item["name"] | "", firstArtist(item));
+    }
+    published.more = !doc["next"].isNull();
+    finishPage(true, "No tracks");
+    unlock();
+}
+
+void loadTrack(const Crumb& c) {
+    beginPage(c);
+    char url[120];
+    snprintf(url, sizeof(url), "https://api.spotify.com/v1/tracks/%s", c.id);
+    if (!spotifyGet(url)) return;
+    JsonDocument filter;
+    filter["duration_ms"] = true;
+    filter["artists"][0]["id"] = true;
+    filter["artists"][0]["name"] = true;
+    filter["album"]["id"] = true;
+    filter["album"]["name"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
+        setStatus("Could not read Spotify");
+        return;
+    }
+    int ms = doc["duration_ms"] | 0;
+    if (ms < 0) ms = 0;
+    char clock[16];
+    snprintf(clock, sizeof(clock), "%d:%02d", ms / 60000, (ms / 1000) % 60);
+    lock();
+    strlcpy(published.status, clock, sizeof(published.status));
+    const char* albumId = doc["album"]["id"] | "";
+    const char* albumName = doc["album"]["name"] | "";
+    if (albumId[0]) addItem(Kind::Album, albumId, albumName[0] ? albumName : "Album", "");
+    int n = 0;
+    for (JsonObject artist : doc["artists"].as<JsonArray>()) {
+        if (n >= 4 || published.count >= MAX_ITEMS) break;
+        const char* id = artist["id"] | "";
+        if (!id[0]) continue;
+        addItem(Kind::Artist, id, artist["name"] | "Artist", "");
+        n++;
+    }
+    finishPage(false, "");
+    unlock();
+}
+
+void loadArtist(const Crumb& c) {
+    beginPage(c);
+    if (c.offset == 0) {
+        lock();
+        addItem(Kind::Radio, c.id, "Radio", "Starts a station");
+        unlock();
+        char topUrl[160];
+        snprintf(topUrl, sizeof(topUrl), "https://api.spotify.com/v1/artists/%s/top-tracks?market=from_token", c.id);
+        if (spotifyGet(topUrl, false)) {
+            JsonDocument filter;
+            filter["tracks"][0]["id"] = true;
+            filter["tracks"][0]["name"] = true;
+            filter["tracks"][0]["artists"][0]["name"] = true;
+            JsonDocument doc;
+            if (!deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
+                lock();
+                int n = 0;
+                for (JsonObject item : doc["tracks"].as<JsonArray>()) {
+                    if (n >= 5 || published.count >= MAX_ITEMS) break;
+                    const char* id = item["id"] | "";
+                    if (!id[0]) continue;
+                    addItem(Kind::Track, id, item["name"] | "", "Popular");
+                    n++;
+                }
+                unlock();
+            }
+        }
+    }
+    char url[220];
+    snprintf(url, sizeof(url),
+             "https://api.spotify.com/v1/artists/%s/albums?include_groups=album,single&market=from_token&limit=10&offset=%d",
+             c.id, c.offset);
+    if (!spotifyGet(url)) return;
+    JsonDocument filter;
+    filter["items"][0]["id"] = true;
+    filter["items"][0]["name"] = true;
+    filter["items"][0]["album_group"] = true;
+    filter["items"][0]["release_date"] = true;
+    filter["next"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
+        setStatus("Could not read Spotify");
+        return;
+    }
+    lock();
+    for (JsonObject item : doc["items"].as<JsonArray>()) {
+        if (published.count >= MAX_ITEMS) break;
+        const char* id = item["id"] | "";
+        if (!id[0]) continue;
+        const char* group = item["album_group"] | "album";
+        const char* date = item["release_date"] | "";
+        char year[8] = "";
+        if (date[0] && date[1] && date[2] && date[3]) {
+            memcpy(year, date, 4);
+            year[4] = 0;
+        }
+        char sub[72];
+        if (!strcmp(group, "single")) snprintf(sub, sizeof(sub), "Single%s%s", year[0] ? "  " : "", year);
+        else strlcpy(sub, year, sizeof(sub));
+        addItem(Kind::Album, id, item["name"] | "", sub);
+    }
+    published.more = !doc["next"].isNull();
+    finishPage(published.count == 0, "Nothing here");
+    unlock();
+}
+
+void loadCrumb() {
+    if (depth < 0) depth = 0;
+    if (depth >= MAX_DEPTH) depth = MAX_DEPTH - 1;
+    Crumb& c = stack[depth];
+    if (c.page == Page::Album) loadAlbum(c);
+    else if (c.page == Page::Playlist) loadPlaylist(c);
+    else if (c.page == Page::Artist) loadArtist(c);
+    else if (c.page == Page::Track) loadTrack(c);
+    else spotifyLoad(c.page == Page::Search, c.query, c.offset);
+}
+
+void openItem(const Item& item) {
+    if (!item.id[0]) {
+        setStatus("Can't open that");
+        return;
+    }
+    if (depth + 1 >= MAX_DEPTH) {
+        setStatus("That's as deep as this list goes");
+        return;
+    }
+    Crumb next = {};
+    strlcpy(next.id, item.id, sizeof(next.id));
+    strlcpy(next.title, item.title, sizeof(next.title));
+    if (item.kind == Kind::Track) {
+        next.page = Page::Track;
+        next.kind = Kind::Track;
+        next.playable = true;
+        next.pageSize = 20;
+    } else if (item.kind == Kind::Album) {
+        next.page = Page::Album;
+        next.kind = Kind::Album;
+        next.playable = true;
+        next.pageSize = 20;
+    } else if (item.kind == Kind::Playlist) {
+        next.page = Page::Playlist;
+        next.kind = Kind::Playlist;
+        next.playable = true;
+        next.pageSize = 20;
+    } else if (item.kind == Kind::Artist) {
+        next.page = Page::Artist;
+        next.kind = Kind::Radio;
+        next.playable = true;
+        next.pageSize = 10;
+    } else if (item.kind == Kind::Radio) {
+        if (!spotifyPlay(item, false)) setStatus("Could not play that");
+        else {
+            lock();
+            published.loading = false;
+            unlock();
+        }
+        return;
+    } else {
+        setStatus("Can't open that");
+        return;
+    }
+    depth++;
+    stack[depth] = next;
+    loadCrumb();
+}
+
+void playPage(bool append) {
+    if (depth < 0 || !stack[depth].playable || !stack[depth].id[0]) return;
+    Item item = {};
+    item.kind = stack[depth].kind;
+    strlcpy(item.id, stack[depth].id, sizeof(item.id));
+    strlcpy(item.title, stack[depth].title, sizeof(item.title));
+    if (!spotifyPlay(item, append)) setStatus("Could not play that");
 }
 
 void probe() {
@@ -438,10 +757,13 @@ void begin() {
 void loop(bool online) {
     if (!mu) return;
     bool probeNow = false, saveNow = false, clearNow = false, listNow = false;
+    bool doBack = false, doReload = false, doPage = false;
     char query[64];
     int offset = 0;
     int play = -1;
     bool append = false;
+    bool haveOpen = false;
+    Item opened = {};
     query[0] = 0;
     lock();
     probeNow = wantProbe;
@@ -458,10 +780,19 @@ void loop(bool online) {
     wantClear = false;
     listNow = wantList;
     wantList = false;
+    doBack = wantBack;
+    wantBack = false;
+    doReload = wantReload;
+    wantReload = false;
+    doPage = wantPagePlay;
+    wantPagePlay = false;
     strlcpy(query, wantQuery, sizeof(query));
     offset = wantOffset;
     play = wantPlay;
     wantPlay = -1;
+    haveOpen = wantOpen;
+    wantOpen = false;
+    if (haveOpen) opened = wantOpenItem;
     append = wantAppend;
     Item item;
     bool haveItem = false;
@@ -490,8 +821,24 @@ void loop(bool online) {
     if (probeNow) probe();
     if (haveItem) {
         if (!spotifyPlay(item, append)) setStatus("Could not play that");
+    } else if (haveOpen) {
+        openItem(opened);
+    } else if (doPage) {
+        playPage(append);
+    } else if (doBack) {
+        if (depth > 0) depth--;
+        loadCrumb();
+    } else if (doReload) {
+        stack[depth].offset = offset < 0 ? 0 : offset;
+        loadCrumb();
     } else if (listNow) {
-        spotifyLoad(query[0] != 0, query, offset);
+        depth = 0;
+        memset(&stack[0], 0, sizeof(stack[0]));
+        stack[0].page = query[0] ? Page::Search : Page::Playlists;
+        stack[0].offset = offset < 0 ? 0 : offset;
+        stack[0].pageSize = 10;
+        strlcpy(stack[0].query, query, sizeof(stack[0].query));
+        loadCrumb();
     }
 }
 
@@ -525,7 +872,13 @@ void requestPlaylists(int offset) {
     wantQuery[0] = 0;
     wantOffset = offset;
     wantList = true;
+    wantReload = false;
+    wantBack = false;
+    wantOpen = false;
+    wantPlay = -1;
+    wantPagePlay = false;
     published.loading = true;
+    published.count = 0;
     unlock();
 }
 
@@ -535,7 +888,57 @@ void requestSearch(const char* query, int offset) {
     strlcpy(wantQuery, query, sizeof(wantQuery));
     wantOffset = offset;
     wantList = true;
+    wantReload = false;
+    wantBack = false;
+    wantOpen = false;
+    wantPlay = -1;
+    wantPagePlay = false;
     published.loading = true;
+    published.count = 0;
+    unlock();
+}
+
+void requestPage(int offset) {
+    if (!mu) return;
+    lock();
+    wantOffset = offset < 0 ? 0 : offset;
+    wantReload = true;
+    wantList = false;
+    wantBack = false;
+    wantOpen = false;
+    published.loading = true;
+    published.count = 0;
+    unlock();
+}
+
+void requestOpen(int index) {
+    if (!mu) return;
+    lock();
+    if (index >= 0 && index < published.count) {
+        wantOpenItem = published.items[index];
+        wantOpen = true;
+        wantPlay = -1;
+        wantPagePlay = false;
+        wantList = false;
+        wantReload = false;
+        wantBack = false;
+        published.loading = true;
+        published.count = 0;
+    }
+    unlock();
+}
+
+void requestBack() {
+    if (!mu) return;
+    lock();
+    wantBack = true;
+    wantList = false;
+    wantReload = false;
+    wantOpen = false;
+    wantPlay = -1;
+    wantPagePlay = false;
+    published.loading = true;
+    published.count = 0;
     unlock();
 }
 
@@ -544,6 +947,18 @@ void requestPlay(int index, bool append) {
     lock();
     wantPlay = index;
     wantAppend = append;
+    wantOpen = false;
+    wantPagePlay = false;
+    unlock();
+}
+
+void requestPagePlay(bool append) {
+    if (!mu) return;
+    lock();
+    wantPagePlay = true;
+    wantAppend = append;
+    wantPlay = -1;
+    wantOpen = false;
     unlock();
 }
 

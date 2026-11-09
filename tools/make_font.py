@@ -105,6 +105,8 @@ def main():
     emit("fontTitle", win + "segoeuib.ttf", 48, lines)
     emit("fontUi", win + "segoeuib.ttf", 30, lines)
     emit("fontBody", win + "segoeui.ttf", 30, lines)
+    emit("fontBrowse", win + "segoeuib.ttf", 38, lines)
+    emit("fontBrowseBody", win + "segoeui.ttf", 38, lines)
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
