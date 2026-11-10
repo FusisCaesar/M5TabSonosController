@@ -129,6 +129,7 @@ uint32_t lastPoll = 0;
 uint32_t lastSweep = 0;
 uint32_t statusUntil = 0;
 uint32_t volumeHoldUntil = 0;
+uint32_t muteHoldUntil = 0;
 int heldVolume = 0;
 int playFails = 0;
 int topoFails = 0;
@@ -1229,6 +1230,27 @@ bool writeVolume(const char* ip, int vol) {
     });
 }
 
+bool readMute(const char* ip, bool* muted) {
+    bool ok = invoke(ip, RC_PATH, RC, "GetMute", [] {
+        el("InstanceID", "0");
+        el("Channel", "Master");
+    });
+    if (!ok) return false;
+    char num[8];
+    copyTag(resp, "CurrentMute", num, sizeof(num));
+    if (!num[0]) return false;
+    *muted = atoi(num) != 0;
+    return true;
+}
+
+bool writeMute(const char* ip, bool muted) {
+    return invoke(ip, RC_PATH, RC, "SetMute", [&] {
+        el("InstanceID", "0");
+        el("Channel", "Master");
+        el("DesiredMute", muted ? "1" : "0");
+    });
+}
+
 void applyPlaying(const char* groupUuid, bool on) {
     if (!groupUuid || !groupUuid[0]) return;
     for (int i = 0; i < roomCount; i++)
@@ -1294,9 +1316,12 @@ bool refreshPlayback() {
         publishRooms();
         int vol = -1;
         bool gotVol = volRoom && readVolume(volRoom->ip, &vol);
+        bool muted = false;
+        bool gotMute = volRoom && readMute(volRoom->ip, &muted);
         lock();
         published.playing = false;
         if (gotVol && millis() >= volumeHoldUntil) published.volume = vol;
+        if (gotMute && millis() >= muteHoldUntil) published.muted = muted;
         unlock();
         return true;
     }
@@ -1356,9 +1381,12 @@ bool refreshPlayback() {
     }
     int vol = -1;
     bool gotVol = volRoom && readVolume(volRoom->ip, &vol);
+    bool muted = false;
+    bool gotMute = volRoom && readMute(volRoom->ip, &muted);
     lock();
     if (gotState) published.playing = playing;
     if (gotVol && millis() >= volumeHoldUntil) published.volume = vol;
+    if (gotMute && millis() >= muteHoldUntil) published.muted = muted;
     unlock();
     return true;
 }
@@ -2118,6 +2146,8 @@ void selectRoom(const char* uuid) {
         if (!strcmp(rooms[i].uuid, uuid)) r = &rooms[i];
     if (!r || !strcmp(r->uuid, active)) return;
     strlcpy(active, r->uuid, sizeof(active));
+    muteHoldUntil = 0;
+    volumeHoldUntil = 0;
     clearNowPlaying();
     clearFavs();
     publishFavs();
@@ -2161,9 +2191,24 @@ void handle(const Command& cmd) {
             heldVolume = vol;
             volumeHoldUntil = millis() + 2500;
             lock();
+            bool wasMuted = published.muted;
             published.volume = vol;
+            if (wasMuted) {
+                published.muted = false;
+                muteHoldUntil = millis() + 2500;
+            }
             unlock();
             if (!volRoom || !writeVolume(volRoom->ip, vol)) setStatus("Volume failed");
+            else if (wasMuted && !writeMute(volRoom->ip, false)) setStatus("Mute failed");
+            break;
+        }
+        case Cmd::Mute: {
+            bool muted = cmd.value != 0;
+            muteHoldUntil = millis() + 2500;
+            lock();
+            published.muted = muted;
+            unlock();
+            if (!volRoom || !writeMute(volRoom->ip, muted)) setStatus("Mute failed");
             break;
         }
         case Cmd::ToggleRoom:

@@ -28,11 +28,13 @@ char refresh[400] = "";
 char secret[80] = "";
 char access[400] = "";
 uint32_t accessUntil = 0;
+int spotifyHttp = 0;
 
 bool wantProbe = false;
 bool wantSave = false;
 bool wantClear = false;
 bool wantList = false;
+bool wantPlaylists = false;
 bool wantReload = false;
 bool wantBack = false;
 bool wantPagePlay = false;
@@ -52,6 +54,7 @@ struct Crumb {
     char id[48];
     char title[72];
     char query[64];
+    char image[IMAGE_CAP];
     int offset;
     int pageSize;
 };
@@ -145,7 +148,8 @@ class Body : public Stream {
     void flush() override {}
 };
 
-int https(const char* url, const char* method, const char* contentType, const char* payload, const char* bearer) {
+int https(const char* url, const char* method, const char* contentType, const char* payload, const char* bearer,
+          size_t* got = nullptr) {
     if (!httpBuf) return -1;
     httpBuf[0] = 0;
     WiFiClientSecure client;
@@ -166,6 +170,7 @@ int https(const char* url, const char* method, const char* contentType, const ch
         body.cap = HTTP_CAP;
         http.writeToStream(&body);
         httpBuf[body.n < HTTP_CAP ? body.n : HTTP_CAP - 1] = 0;
+        if (got) *got = body.n;
     }
     http.end();
     return code;
@@ -232,7 +237,7 @@ bool ensureAccess() {
     return refreshAccess();
 }
 
-void addItem(Kind kind, const char* id, const char* title, const char* subtitle) {
+void addItem(Kind kind, const char* id, const char* title, const char* subtitle, const char* image = nullptr) {
     if (!id || !id[0] || published.count >= MAX_ITEMS) return;
     Item& it = published.items[published.count++];
     memset(&it, 0, sizeof(it));
@@ -240,6 +245,27 @@ void addItem(Kind kind, const char* id, const char* title, const char* subtitle)
     strlcpy(it.id, id, sizeof(it.id));
     strlcpy(it.title, title && title[0] ? title : "Untitled", sizeof(it.title));
     strlcpy(it.subtitle, subtitle ? subtitle : "", sizeof(it.subtitle));
+    if (image && image[0]) strlcpy(it.image, image, sizeof(it.image));
+}
+
+// Smallest cover Spotify offers. Rows are 90px, and the 300px and 640px files are the slow part.
+const char* coverUrl(JsonVariant images) {
+    JsonArray arr = images.as<JsonArray>();
+    if (arr.isNull()) return "";
+    const char* best = "";
+    int bestW = 1000000;
+    const char* fallback = "";
+    for (JsonObject im : arr) {
+        const char* url = im["url"] | "";
+        if (!url[0] || strlen(url) >= IMAGE_CAP) continue;
+        fallback = url;
+        int w = im["width"] | 0;
+        if (w > 0 && w < bestW) {
+            best = url;
+            bestW = w;
+        }
+    }
+    return best[0] ? best : fallback;
 }
 
 const char* firstArtist(JsonObject item) {
@@ -249,6 +275,7 @@ const char* firstArtist(JsonObject item) {
 }
 
 bool spotifyGet(const char* url, bool report = true) {
+    spotifyHttp = 0;
     if (!ensureAccess()) return false;
     char auth[460];
     snprintf(auth, sizeof(auth), "Bearer %s", access);
@@ -259,7 +286,9 @@ bool spotifyGet(const char* url, bool report = true) {
         if (!ensureAccess()) return false;
         snprintf(auth, sizeof(auth), "Bearer %s", access);
         code = https(url, "GET", "", "", auth);
+        Serial.printf("[svc] GET %d %s\n", code, url);
     }
+    spotifyHttp = code;
     if (code == 429) {
         if (report) setStatus("Spotify is busy, try again");
         return false;
@@ -285,7 +314,8 @@ void takePage(JsonArray items, Kind kind, int limit) {
         const char* name = item["name"] | "";
         const char* sub = kind == Kind::Playlist ? item["owner"]["display_name"] | "" : firstArtist(item);
         if (kind == Kind::Artist) sub = "Artist";
-        addItem(kind, id, name, sub);
+        const char* image = kind == Kind::Track ? coverUrl(item["album"]["images"]) : coverUrl(item["images"]);
+        addItem(kind, id, name, sub, image);
         n++;
     }
 }
@@ -326,19 +356,29 @@ void spotifyLoad(bool search, const char* query, int offset) {
         filter["items"][0]["id"] = true;
         filter["items"][0]["name"] = true;
         filter["items"][0]["owner"]["display_name"] = true;
+        filter["items"][0]["images"][0]["url"] = true;
+        filter["items"][0]["images"][0]["width"] = true;
         filter["next"] = true;
     } else {
         filter["tracks"]["items"][0]["id"] = true;
         filter["tracks"]["items"][0]["name"] = true;
         filter["tracks"]["items"][0]["artists"][0]["name"] = true;
+        filter["tracks"]["items"][0]["album"]["images"][0]["url"] = true;
+        filter["tracks"]["items"][0]["album"]["images"][0]["width"] = true;
         filter["albums"]["items"][0]["id"] = true;
         filter["albums"]["items"][0]["name"] = true;
         filter["albums"]["items"][0]["artists"][0]["name"] = true;
+        filter["albums"]["items"][0]["images"][0]["url"] = true;
+        filter["albums"]["items"][0]["images"][0]["width"] = true;
         filter["playlists"]["items"][0]["id"] = true;
         filter["playlists"]["items"][0]["name"] = true;
         filter["playlists"]["items"][0]["owner"]["display_name"] = true;
+        filter["playlists"]["items"][0]["images"][0]["url"] = true;
+        filter["playlists"]["items"][0]["images"][0]["width"] = true;
         filter["artists"]["items"][0]["id"] = true;
         filter["artists"]["items"][0]["name"] = true;
+        filter["artists"]["items"][0]["images"][0]["url"] = true;
+        filter["artists"]["items"][0]["images"][0]["width"] = true;
         filter["tracks"]["next"] = true;
     }
     JsonDocument doc;
@@ -365,8 +405,11 @@ void spotifyLoad(bool search, const char* query, int offset) {
     published.pageSize = 10;
     if (published.count == 0) strlcpy(published.status, search ? "No matches" : "No playlists", sizeof(published.status));
     else published.status[0] = 0;
+    int covers = 0;
+    for (int i = 0; i < published.count; i++)
+        if (published.items[i].image[0]) covers++;
     unlock();
-    Serial.printf("[svc] %d items\n", published.count);
+    Serial.printf("[svc] %d items, %d covers\n", published.count, covers);
 }
 
 // Sonos addresses, from SoCo's ShareLink table. The fallback is the form this
@@ -518,7 +561,7 @@ void loadAlbum(const Crumb& c) {
             size_t n = strlen(sub);
             snprintf(sub + n, sizeof(sub) - n, "  %s", artist);
         }
-        addItem(Kind::Track, id, item["name"] | "", sub);
+        addItem(Kind::Track, id, item["name"] | "", sub, c.image);
     }
     published.more = !doc["next"].isNull();
     finishPage(true, "No tracks");
@@ -527,16 +570,30 @@ void loadAlbum(const Crumb& c) {
 
 void loadPlaylist(const Crumb& c) {
     beginPage(c);
-    char url[280];
+    char url[420];
     snprintf(url, sizeof(url),
-             "https://api.spotify.com/v1/playlists/%s/tracks?limit=20&offset=%d&fields=items(track(id,name,type,artists(name))),next",
+             "https://api.spotify.com/v1/playlists/%s/items?limit=20&offset=%d"
+             "&fields=items(item(id,name,type,artists(name),album(images(url,width)))),next",
              c.id, c.offset);
-    if (!spotifyGet(url)) return;
+    if (!spotifyGet(url, false)) {
+        if (spotifyHttp == 403) setStatus("Spotify won't list these tracks. Play will start it.");
+        else if (spotifyHttp == 429) setStatus("Spotify is busy, try again");
+        else setStatus("Spotify did not answer");
+        return;
+    }
     JsonDocument filter;
+    filter["items"][0]["item"]["id"] = true;
+    filter["items"][0]["item"]["name"] = true;
+    filter["items"][0]["item"]["type"] = true;
+    filter["items"][0]["item"]["artists"][0]["name"] = true;
+    filter["items"][0]["item"]["album"]["images"][0]["url"] = true;
+    filter["items"][0]["item"]["album"]["images"][0]["width"] = true;
     filter["items"][0]["track"]["id"] = true;
     filter["items"][0]["track"]["name"] = true;
     filter["items"][0]["track"]["type"] = true;
     filter["items"][0]["track"]["artists"][0]["name"] = true;
+    filter["items"][0]["track"]["album"]["images"][0]["url"] = true;
+    filter["items"][0]["track"]["album"]["images"][0]["width"] = true;
     filter["next"] = true;
     JsonDocument doc;
     if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
@@ -546,17 +603,33 @@ void loadPlaylist(const Crumb& c) {
     lock();
     for (JsonObject wrap : doc["items"].as<JsonArray>()) {
         if (published.count >= MAX_ITEMS) break;
-        JsonObject item = wrap["track"];
+        JsonObject item = wrap["item"];
+        if (item.isNull()) item = wrap["track"];
         if (item.isNull()) continue;
         const char* type = item["type"] | "track";
         if (strcmp(type, "track")) continue;
         const char* id = item["id"] | "";
         if (!id[0]) continue;
-        addItem(Kind::Track, id, item["name"] | "", firstArtist(item));
+        addItem(Kind::Track, id, item["name"] | "", firstArtist(item), coverUrl(item["album"]["images"]));
     }
     published.more = !doc["next"].isNull();
     finishPage(true, "No tracks");
     unlock();
+}
+
+// A track's artist objects have no pictures. The artist endpoint does.
+void copyArtistImage(const char* id, char* dst, size_t cap) {
+    dst[0] = 0;
+    char url[80];
+    snprintf(url, sizeof(url), "https://api.spotify.com/v1/artists/%s", id);
+    if (!spotifyGet(url, false)) return;
+    JsonDocument filter;
+    filter["images"][0]["url"] = true;
+    filter["images"][0]["width"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) return;
+    const char* image = coverUrl(doc["images"]);
+    if (image && image[0]) strlcpy(dst, image, cap);
 }
 
 void loadTrack(const Crumb& c) {
@@ -570,6 +643,8 @@ void loadTrack(const Crumb& c) {
     filter["artists"][0]["name"] = true;
     filter["album"]["id"] = true;
     filter["album"]["name"] = true;
+    filter["album"]["images"][0]["url"] = true;
+    filter["album"]["images"][0]["width"] = true;
     JsonDocument doc;
     if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
         setStatus("Could not read Spotify");
@@ -579,19 +654,34 @@ void loadTrack(const Crumb& c) {
     if (ms < 0) ms = 0;
     char clock[16];
     snprintf(clock, sizeof(clock), "%d:%02d", ms / 60000, (ms / 1000) % 60);
-    lock();
-    strlcpy(published.status, clock, sizeof(published.status));
-    const char* albumId = doc["album"]["id"] | "";
-    const char* albumName = doc["album"]["name"] | "";
-    if (albumId[0]) addItem(Kind::Album, albumId, albumName[0] ? albumName : "Album", "");
-    int n = 0;
+    char albumId[48] = "";
+    char albumName[72] = "";
+    char albumImage[IMAGE_CAP] = "";
+    strlcpy(albumId, doc["album"]["id"] | "", sizeof(albumId));
+    strlcpy(albumName, doc["album"]["name"] | "", sizeof(albumName));
+    strlcpy(albumImage, coverUrl(doc["album"]["images"]), sizeof(albumImage));
+    struct Who {
+        char id[48];
+        char name[72];
+        char image[IMAGE_CAP];
+    };
+    Who who[4];
+    int whoN = 0;
     for (JsonObject artist : doc["artists"].as<JsonArray>()) {
-        if (n >= 4 || published.count >= MAX_ITEMS) break;
+        if (whoN >= 4) break;
         const char* id = artist["id"] | "";
         if (!id[0]) continue;
-        addItem(Kind::Artist, id, artist["name"] | "Artist", "");
-        n++;
+        strlcpy(who[whoN].id, id, sizeof(who[whoN].id));
+        strlcpy(who[whoN].name, artist["name"] | "Artist", sizeof(who[whoN].name));
+        who[whoN].image[0] = 0;
+        whoN++;
     }
+    for (int i = 0; i < whoN; i++) copyArtistImage(who[i].id, who[i].image, sizeof(who[i].image));
+    lock();
+    strlcpy(published.status, clock, sizeof(published.status));
+    if (albumId[0]) addItem(Kind::Album, albumId, albumName[0] ? albumName : "Album", "", albumImage);
+    for (int i = 0; i < whoN && published.count < MAX_ITEMS; i++)
+        addItem(Kind::Artist, who[i].id, who[i].name, "", who[i].image);
     finishPage(false, "");
     unlock();
 }
@@ -600,7 +690,7 @@ void loadArtist(const Crumb& c) {
     beginPage(c);
     if (c.offset == 0) {
         lock();
-        addItem(Kind::Radio, c.id, "Radio", "Starts a station");
+        addItem(Kind::Radio, c.id, "Radio", "Starts a station", c.image);
         unlock();
         char topUrl[160];
         snprintf(topUrl, sizeof(topUrl), "https://api.spotify.com/v1/artists/%s/top-tracks?market=from_token", c.id);
@@ -609,6 +699,8 @@ void loadArtist(const Crumb& c) {
             filter["tracks"][0]["id"] = true;
             filter["tracks"][0]["name"] = true;
             filter["tracks"][0]["artists"][0]["name"] = true;
+            filter["tracks"][0]["album"]["images"][0]["url"] = true;
+            filter["tracks"][0]["album"]["images"][0]["width"] = true;
             JsonDocument doc;
             if (!deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
                 lock();
@@ -617,7 +709,7 @@ void loadArtist(const Crumb& c) {
                     if (n >= 5 || published.count >= MAX_ITEMS) break;
                     const char* id = item["id"] | "";
                     if (!id[0]) continue;
-                    addItem(Kind::Track, id, item["name"] | "", "Popular");
+                    addItem(Kind::Track, id, item["name"] | "", "Popular", coverUrl(item["album"]["images"]));
                     n++;
                 }
                 unlock();
@@ -634,6 +726,8 @@ void loadArtist(const Crumb& c) {
     filter["items"][0]["name"] = true;
     filter["items"][0]["album_group"] = true;
     filter["items"][0]["release_date"] = true;
+    filter["items"][0]["images"][0]["url"] = true;
+    filter["items"][0]["images"][0]["width"] = true;
     filter["next"] = true;
     JsonDocument doc;
     if (deserializeJson(doc, httpBuf, DeserializationOption::Filter(filter))) {
@@ -655,7 +749,7 @@ void loadArtist(const Crumb& c) {
         char sub[72];
         if (!strcmp(group, "single")) snprintf(sub, sizeof(sub), "Single%s%s", year[0] ? "  " : "", year);
         else strlcpy(sub, year, sizeof(sub));
-        addItem(Kind::Album, id, item["name"] | "", sub);
+        addItem(Kind::Album, id, item["name"] | "", sub, coverUrl(item["images"]));
     }
     published.more = !doc["next"].isNull();
     finishPage(published.count == 0, "Nothing here");
@@ -685,6 +779,7 @@ void openItem(const Item& item) {
     Crumb next = {};
     strlcpy(next.id, item.id, sizeof(next.id));
     strlcpy(next.title, item.title, sizeof(next.title));
+    strlcpy(next.image, item.image, sizeof(next.image));
     if (item.kind == Kind::Track) {
         next.page = Page::Track;
         next.kind = Kind::Track;
@@ -731,6 +826,153 @@ void playPage(bool append) {
     if (!spotifyPlay(item, append)) setStatus("Could not play that");
 }
 
+struct Art {
+    char url[IMAGE_CAP];
+    uint8_t* data;
+    size_t len;
+};
+Art arts[MAX_ITEMS];
+
+void rememberArt(const char* url, uint8_t* data, size_t len) {
+    lock();
+    Art* slot = nullptr;
+    for (Art& a : arts) {
+        if (a.url[0] && !strcmp(a.url, url)) {
+            heap_caps_free(a.data);
+            a.data = data;
+            a.len = data ? len : 0;
+            unlock();
+            return;
+        }
+        if (!slot && !a.url[0]) slot = &a;
+    }
+    if (!slot) {
+        heap_caps_free(data);
+        unlock();
+        return;
+    }
+    strlcpy(slot->url, url, sizeof(slot->url));
+    slot->data = data;
+    slot->len = data ? len : 0;
+    unlock();
+}
+
+void hostOf(const char* url, char* dst, size_t cap) {
+    dst[0] = 0;
+    if (!url || !cap) return;
+    const char* p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    size_t n = 0;
+    while (p[n] && p[n] != '/' && p[n] != ':' && n + 1 < cap) {
+        dst[n] = p[n];
+        n++;
+    }
+    dst[n] = 0;
+}
+
+bool imageBytes(const uint8_t* p, size_t n) {
+    if (n > 2 && p[0] == 0xFF && p[1] == 0xD8) return true;
+    return n > 8 && p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G';
+}
+
+void serviceOneArt() {
+    static char urls[MAX_ITEMS][IMAGE_CAP];
+    int n = 0;
+    lock();
+    for (int i = 0; i < published.count && n < MAX_ITEMS; i++) {
+        const char* u = published.items[i].image;
+        if (!u[0]) continue;
+        bool seen = false;
+        for (int k = 0; k < n; k++)
+            if (!strcmp(urls[k], u)) seen = true;
+        if (!seen) strlcpy(urls[n++], u, IMAGE_CAP);
+    }
+    for (Art& a : arts) {
+        if (!a.url[0]) continue;
+        bool keep = false;
+        for (int i = 0; i < n; i++)
+            if (!strcmp(urls[i], a.url)) keep = true;
+        if (keep) continue;
+        heap_caps_free(a.data);
+        a = {};
+    }
+    int missing = 0;
+    for (int i = 0; i < n; i++) {
+        bool have = false;
+        for (Art& a : arts)
+            if (!strcmp(a.url, urls[i])) have = true;
+        if (have) continue;
+        if (missing != i) memcpy(urls[missing], urls[i], IMAGE_CAP);
+        missing++;
+    }
+    unlock();
+    if (!missing) return;
+
+    for (int i = 0; i < missing; i++) {
+        char hi[48];
+        hostOf(urls[i], hi, sizeof(hi));
+        for (int j = i + 1; j < missing; j++) {
+            char hj[48];
+            hostOf(urls[j], hj, sizeof(hj));
+            if (strcmp(hi, hj) <= 0) continue;
+            char tmp[IMAGE_CAP];
+            memcpy(tmp, urls[i], IMAGE_CAP);
+            memcpy(urls[i], urls[j], IMAGE_CAP);
+            memcpy(urls[j], tmp, IMAGE_CAP);
+            memcpy(hi, hj, sizeof(hi));
+        }
+    }
+
+    static uint32_t pauseUntil = 0;
+    if ((int32_t)(millis() - pauseUntil) < 0) return;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(3);
+    HTTPClient http;
+    http.setReuse(true);
+    http.setConnectTimeout(2000);
+    http.setTimeout(2500);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+    for (int i = 0; i < missing; i++) {
+        const char* url = urls[i];
+        if (strncmp(url, "https://", 8)) {
+            rememberArt(url, nullptr, 0);
+            continue;
+        }
+        uint32_t t0 = millis();
+        int code = -1;
+        size_t got = 0;
+        if (http.begin(client, url)) {
+            code = http.GET();
+            if (code == 200) {
+                Body body;
+                body.buf = httpBuf;
+                body.cap = HTTP_CAP;
+                http.writeToStream(&body);
+                got = body.n;
+            }
+            http.end();
+        }
+        uint32_t took = millis() - t0;
+        bool picture = code == 200 && got + 1 < HTTP_CAP && imageBytes((uint8_t*)httpBuf, got);
+        if (picture) {
+            uint8_t* keep = (uint8_t*)heap_caps_malloc(got, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (keep) memcpy(keep, httpBuf, got);
+            rememberArt(url, keep, keep ? got : 0);
+            Serial.printf("[svc] art %s %u in %ums\n", keep ? "ok" : "miss", (unsigned)got, (unsigned)took);
+        } else if (code <= 0) {
+            Serial.printf("[svc] art retry %d in %ums\n", code, (unsigned)took);
+            pauseUntil = millis() + 600;
+            break;
+        } else {
+            rememberArt(url, nullptr, 0);
+            Serial.printf("[svc] art miss %d in %ums\n", code, (unsigned)took);
+        }
+    }
+}
+
 void probe() {
     const char* hosts[] = {"https://api.spotify.com/v1/", "https://accounts.spotify.com/"};
     for (const char* url : hosts) {
@@ -747,7 +989,7 @@ void begin() {
     mu = xSemaphoreCreateMutex();
     httpBuf = (char*)heap_caps_malloc(HTTP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     memset(&published, 0, sizeof(published));
-    strlcpy(published.heading, "My playlists", sizeof(published.heading));
+    strlcpy(published.heading, "Search", sizeof(published.heading));
     loadCredentials();
     published.signedIn = clientId[0] && refresh[0];
     if (!published.signedIn) strlcpy(published.status, "Sign in with tools/spotify_auth.py", sizeof(published.status));
@@ -756,7 +998,7 @@ void begin() {
 
 void loop(bool online) {
     if (!mu) return;
-    bool probeNow = false, saveNow = false, clearNow = false, listNow = false;
+    bool probeNow = false, saveNow = false, clearNow = false, listNow = false, playlistsNow = false;
     bool doBack = false, doReload = false, doPage = false;
     char query[64];
     int offset = 0;
@@ -780,6 +1022,8 @@ void loop(bool online) {
     wantClear = false;
     listNow = wantList;
     wantList = false;
+    playlistsNow = wantPlaylists;
+    wantPlaylists = false;
     doBack = wantBack;
     wantBack = false;
     doReload = wantReload;
@@ -834,11 +1078,31 @@ void loop(bool online) {
     } else if (listNow) {
         depth = 0;
         memset(&stack[0], 0, sizeof(stack[0]));
-        stack[0].page = query[0] ? Page::Search : Page::Playlists;
-        stack[0].offset = offset < 0 ? 0 : offset;
-        stack[0].pageSize = 10;
-        strlcpy(stack[0].query, query, sizeof(stack[0].query));
-        loadCrumb();
+        if (!playlistsNow && !query[0]) {
+            stack[0].page = Page::Search;
+            lock();
+            published.loading = false;
+            published.count = 0;
+            published.offset = 0;
+            published.more = false;
+            published.canBack = false;
+            published.pagePlayable = false;
+            published.pageKind = Kind::Track;
+            published.pageSize = 10;
+            published.query[0] = 0;
+            published.status[0] = 0;
+            published.signedIn = clientId[0] && refresh[0];
+            strlcpy(published.heading, "Search", sizeof(published.heading));
+            unlock();
+        } else {
+            stack[0].page = playlistsNow ? Page::Playlists : Page::Search;
+            stack[0].offset = offset < 0 ? 0 : offset;
+            stack[0].pageSize = 10;
+            strlcpy(stack[0].query, query, sizeof(stack[0].query));
+            loadCrumb();
+        }
+    } else if (online) {
+        serviceOneArt();
     }
 }
 
@@ -872,6 +1136,7 @@ void requestPlaylists(int offset) {
     wantQuery[0] = 0;
     wantOffset = offset;
     wantList = true;
+    wantPlaylists = true;
     wantReload = false;
     wantBack = false;
     wantOpen = false;
@@ -888,13 +1153,25 @@ void requestSearch(const char* query, int offset) {
     strlcpy(wantQuery, query, sizeof(wantQuery));
     wantOffset = offset;
     wantList = true;
+    wantPlaylists = false;
     wantReload = false;
     wantBack = false;
     wantOpen = false;
     wantPlay = -1;
     wantPagePlay = false;
-    published.loading = true;
     published.count = 0;
+    published.canBack = false;
+    published.pagePlayable = false;
+    if (!query[0]) {
+        published.loading = false;
+        published.offset = 0;
+        published.more = false;
+        published.query[0] = 0;
+        published.status[0] = 0;
+        strlcpy(published.heading, "Search", sizeof(published.heading));
+    } else {
+        published.loading = true;
+    }
     unlock();
 }
 
@@ -960,6 +1237,25 @@ void requestPagePlay(bool append) {
     wantPlay = -1;
     wantOpen = false;
     unlock();
+}
+
+size_t copyArt(const char* url, uint8_t* dst, size_t cap, bool* failed) {
+    if (failed) *failed = false;
+    if (!mu || !url || !url[0] || !dst) return 0;
+    lock();
+    size_t n = 0;
+    for (Art& a : arts) {
+        if (strcmp(a.url, url)) continue;
+        if (a.data && a.len && a.len <= cap) {
+            memcpy(dst, a.data, a.len);
+            n = a.len;
+        } else {
+            if (failed) *failed = true;
+        }
+        break;
+    }
+    unlock();
+    return n;
 }
 
 void copyView(View& out) {

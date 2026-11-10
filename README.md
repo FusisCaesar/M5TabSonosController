@@ -1,21 +1,21 @@
 # M5Tab Sonos Controller
 
-A touch-screen Sonos remote for the [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5). Hang it on the wall, tap a room, and play music. It also browses Spotify and plays YouTube on your speakers, and it needs no phone, no PC and no cloud service of its own once it is set up.
+A wall controller for the [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5) that plays **YouTube on your Sonos speakers**. Search on the tablet, tap a video, and the room plays the audio. No phone, no PC and no extra box in the middle. It is also a full Sonos remote: rooms and grouping, transport, volume, the queue, favorites and Spotify.
 
 ![Tab5](https://img.shields.io/badge/board-M5Stack%20Tab5-blue) ![ESP32-P4](https://img.shields.io/badge/chip-ESP32--P4-orange) ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
 > **Status:** a hobby project that works well on the author's unit. It has been tested on one Tab5 and one Sonos system. Expect rough edges, and please open an issue if you find one.
 
 <p align="center">
-  <img src="docs/images/now-playing-youtube.png" alt="Now playing a YouTube video on a Sonos room" width="720">
+  <img src="docs/images/now-playing-youtube.png" alt="YouTube playing in a Sonos room, with grouping on the room list" width="720">
 </p>
 
 ## What it does
 
+- **YouTube, on the speakers.** Search YouTube on the Tab5. Each result has a thumbnail, the channel, the length, how old the video is and, when YouTube sends it, the view count. A second view lays the same results out three across, large enough to pick by the picture. Tap a row or a picture to play. Tap the star to keep it. Saved videos sit in a Starred list, with their thumbnails, and they survive a reboot (up to 24). While a video plays, the home screen shows the YouTube mark, the title, the channel, the thumbnail and a star. The sound comes out of the Sonos room. The tablet has to stay powered and on the network for the whole video. See [YouTube, and why it is fragile](#youtube-and-why-it-is-fragile).
 - **Sonos control.** Finds your speakers on the local network, shows every room, and controls the one you pick: play, pause, next, previous, volume, now playing with album art, the room's queue, and your Sonos favorites.
-- **Rooms.** Tapping a room only selects it. Grouping is explicit: a **+** adds a room to the playing group and a **-** takes it out.
-- **Spotify.** Search Spotify with an on-screen keyboard, open songs, albums, playlists and artists before playing (an artist gives its albums and radio), play now or add to the Sonos queue, and browse your own playlists. Playback runs through your Sonos system, not through the Tab5.
-- **YouTube.** Search YouTube and play a video's audio on the speaker, with no helper PC. The now-playing screen shows YouTube, the title, the channel and the thumbnail. Star videos and pick them later from a **Starred** list with thumbnails. See [YouTube, and why it is fragile](#youtube-and-why-it-is-fragile).
+- **Rooms.** Tapping a room only selects it. A **+** adds that room to the playing group. A **−** takes it out.
+- **Spotify.** Search Spotify with an on-screen keyboard, open songs, albums, playlists and artists before playing (an artist gives its albums and radio), play now or add to the Sonos queue, and browse your own playlists. Covers show when Spotify provides them. Playback runs through your Sonos system.
 - **Setup without a computer.** On first start the Tab5 opens its own Wi-Fi network and a small web page where you choose your home Wi-Fi.
 
 ## What you need
@@ -52,7 +52,7 @@ If the upload cannot find the board, hold the boot button while resetting it. Mo
 
 ## First start
 
-1. The screen asks you to join a Wi-Fi network named like `TabSonos...`. Join it with your phone.
+1. While the Tab5 is joining Wi-Fi, the screen is a splash titled **Sonos Control**. With no network stored, it asks you to join a Wi-Fi network named like `TabSonos...`. Join it with your phone.
 2. Open `http://192.168.4.1` (most phones open it for you), choose your home network and type the password.
 3. The Tab5 joins your network, the setup network closes, and the room list appears. The Tab5 remembers the network.
 
@@ -60,30 +60,42 @@ You can also set the network over USB serial with `W ssid|password`. See [Serial
 
 ## Using it
 
-- **Left side:** the rooms. Tap a room to control it. Use **+** and **-** to group or ungroup rooms.
-- **Middle:** what is playing, with album art, title, artist, the source (Spotify, Radio, YouTube and so on) and the clock.
-- **Bottom:** previous, play/pause, next, and a volume slider.
-- **Top right:** **Browse** (Spotify and YouTube), **Queue** (the selected room's queue) and **Favorites** (your Sonos favorites).
-
-### Spotify
-
-Tap **Browse**, then **Spotify**. Tap the search field to open the keyboard, type, and press **Search**.
-
-- The triangle plays the item now. The plus adds it to the Sonos queue.
-- Tapping a song, album, playlist or artist opens it, so you can see what is inside before you play.
-- **My playlists** lists your own playlists.
-
-| Search | Open an item |
-| --- | --- |
-| ![Spotify search results](docs/images/spotify-search.png) | ![Spotify detail page](docs/images/spotify-detail.png) |
+- **Left side:** the rooms. Tap a room to control it. A **+** adds it to the group. A **−** takes it out.
+- **Middle:** what is playing, with album art, title, artist, the source (YouTube, Spotify, radio and so on) and the clock.
+- **Now playing:** previous, play/pause and next sit with the track. On the home screen the volume slider runs along the bottom, with mute at its right end. Browse covers the slider. Dragging the slider while the room is muted turns the sound back on.
+- **Top left:** a speaker and the name of the room you are controlling. Tap it to leave Browse, Queue, Favorites or Settings and return to the home screen.
+- **Top right:** icons for **Browse** (magnifier), **Queue**, **Favorites** (heart) and **Settings** (gear), then the battery. The battery is an icon only. The address of the Tab5 is on the Device tab in Settings.
+- **Settings.** Three tabs. **Wi-Fi** joins, forgets or reconnects a network. **Screen** sets how long the backlight stays on, and whether a tap clicks (off, a low tone, or a higher one). **Device** shows the battery, memory, signal and uptime. The screen sleeps after that, and the next tap wakes it without pressing whatever is underneath. A button lights up while it is pressed, and the speaker makes a short click.
+- **Rotation.** The screen starts upside down from the panel's native landscape, which is how this tablet is mounted. Turn it over and it follows. The layout stays landscape.
 
 ### YouTube
 
-Tap **Browse**, then **YouTube**, search, and tap a row to play it. The star on a row, or the star next to the title on the playing screen, saves the video. The **Starred** chip lists your saved videos with thumbnails. Tap a row to play it, or its star to remove it. Up to 24 videos are kept, and they survive a reboot.
+Tap **Browse**, then **YouTube**. The list starts empty. Tap the search field, type, and press **Search**.
 
-| Search | Starred |
+- Tap a row, or a picture in the grid, and the tablet leaves search and shows the home screen with transport and volume.
+- The star on a result saves the video. The star beside the title on the home screen does the same for whatever is playing. The star chip opens the saved list. Tap a saved row to play it, or its star to remove it.
+- The grid chip switches between the text list and three pictures per row. Each card shows the age and the view count under the title.
+
+| Search | Three across |
 | --- | --- |
-| ![YouTube search results](docs/images/youtube-search.png) | ![Starred YouTube videos with thumbnails](docs/images/youtube-starred.png) |
+| ![YouTube search with thumbnails, age and view counts](docs/images/youtube-search.png) | ![YouTube results as three large thumbnails per row](docs/images/youtube-grid.png) |
+
+<p align="center">
+  <img src="docs/images/youtube-starred.png" alt="Starred YouTube videos, each with a thumbnail" width="720">
+</p>
+
+### Spotify
+
+Tap **Browse**, then **Spotify**. The list starts empty. Tap the search field, type, and press **Search**.
+
+- The triangle plays the item now. The plus adds it to the Sonos queue.
+- Tapping a song, album, or artist opens it. An artist shows albums and radio. A playlist you own opens its tracks. Spotify does not share the track list of someone else's playlist; play still starts it.
+- Songs, albums, playlists and artists show their cover when Spotify provides one.
+- The list chip opens **My playlists**.
+
+| Search | Open an item |
+| --- | --- |
+| ![Spotify search with cover art](docs/images/spotify-search.png) | ![A Spotify song opened before playing](docs/images/spotify-detail.png) |
 
 ## Spotify setup
 
@@ -106,7 +118,7 @@ Spotify app rules apply. An app in development mode is limited to a small list o
 
 ## YouTube, and why it is fragile
 
-YouTube has no official way to play its audio on a Sonos speaker, and the speaker cannot play a YouTube address by itself. This project does it like this:
+Search, thumbnails and the grid are the surface. Under them, YouTube has no official way to play its audio on a Sonos speaker, and the speaker cannot play a YouTube address by itself. This project does it like this:
 
 1. When you tap a result, the Tab5 asks YouTube's internal player endpoint (InnerTube) for the video's address, pretending to be a mobile YouTube app.
 2. YouTube refuses to serve the speaker directly, because Sonos does not send the byte-range requests YouTube requires. So the Tab5 acts as a small web server on port 8080. The speaker is told to play `http://<tab5>:8080/yt/...`, and the Tab5 downloads the video's MP4 file from YouTube into a 6 MB buffer in its memory. It then pulls the audio track out of that file and sends it to the speaker as a plain AAC stream, the way an internet radio station would. (Handing over the MP4 itself works for about twelve minutes. The speaker then runs out of its sample table and stops, so a long video would cut off.)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 // Music services the Tab5 talks to directly. Spotify is the first provider.
@@ -10,12 +11,14 @@ namespace svc {
 enum class Kind : uint8_t { Track, Album, Playlist, Artist, Radio };
 
 constexpr int MAX_ITEMS = 20;
+constexpr int IMAGE_CAP = 240;
 
 struct Item {
     Kind kind;
     char id[48];
     char title[72];
     char subtitle[72];
+    char image[IMAGE_CAP];  // smallest cover Spotify returned, or empty
 };
 
 struct View {
@@ -51,6 +54,8 @@ void requestPlay(int index, bool append);
 void requestPagePlay(bool append);
 
 void copyView(View& out);
+// Copies a downloaded cover JPEG. Returns 0 when it is not ready. failed is set when the download was given up.
+size_t copyArt(const char* url, uint8_t* dst, size_t cap, bool* failed);
 const char* providerName();
 
 }  // namespace svc

@@ -13,6 +13,8 @@ struct Item {
     char title[80];
     char channel[48];
     int seconds;
+    char age[16];    // "4 days", "2 hrs"; empty when YouTube did not say
+    char views[16];  // "1.2M"; empty when YouTube did not say
 };
 
 struct View {

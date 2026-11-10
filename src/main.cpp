@@ -125,7 +125,7 @@ static void serialCommands() {
 void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
-    cfg.internal_imu = false;
+    cfg.internal_imu = true;  // screen rotation. Read only from the UI loop, under the I2C lock.
     M5.begin(cfg);
     Serial.setTxTimeoutMs(0);
     board::begin();
