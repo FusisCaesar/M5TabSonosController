@@ -71,7 +71,7 @@ M5.Power.setExtOutput(true);  // Grove / M5-Bus / side-header 5 V
 M5.Ex_I2C.release();           // Port A is I2C until this returns
 ```
 
-`M5.config()` defaults leave the internal RTC, mic, and speaker enabled. This firmware only overrides baud and IMU. It never calls `Mic.begin()` or `Speaker.begin()`. Pin configs for audio are registered; the codecs are not programmed until those objects start. Leave them off unless the new app needs audio. See the address collision under I2C.
+`M5.config()` defaults leave the internal RTC, mic, and speaker enabled. This firmware overrides the baud rate and turns the IMU on. It never calls `Mic.begin()` or `Speaker.begin()`. Pin configs for audio are registered; the codecs are not programmed until those objects start. Leave them off unless the new app needs audio. See the address collision under I2C. The IMU is read from the UI loop, under the I2C lock, a few times a second, to choose between the two landscape rotations. There is no separate IMU task.
 
 Order that matters:
 
@@ -169,7 +169,9 @@ Bring-up details the application relies on and must not redo:
 - ST7123 porch timings are load-bearing for touch, not just for the picture. `vsync_back_porch + vsync_pulse_width` stays 10 or the image shifts. Cutting `vsync_front_porch` (220) makes the touch controller stop. Leave the panel config to M5GFX.
 - Backlight is LEDC PWM on GPIO22, channel 7, 44100 Hz. `M5.Display.setBrightness(0..255)` under the I2C lock. A default of 200 is readable. Floor used by the rowing UI was 20.
 
-Landscape is a rotation, not a second panel. Native is portrait. This UI uses `M5.Display.setRotation(flip ? 1 : 3)` so a 180° mount stays landscape. Rotation 1 was the first sketch that came up the right way; rotation 3 is that view turned 180°. Any PPA blit has to apply the same rotation as `Panel_FrameBufferBase::display()`, including `offset_rotation`, or sprites land mirrored or off-screen.
+Landscape is a rotation, not a second panel. Native is portrait. This UI uses rotation 1 or 3, both 1280×720. It starts on rotation 3, because the wall mount is that way up and a fixed mount never produces a new accelerometer reading to correct it. The resting pose keeps rotation 3. Turning the tablet over selects rotation 1 after it holds still. Held on its short edge, the last landscape rotation stays, because the layout is the wide one. Rotation 1 was the first sketch that came up the right way; rotation 3 is that view turned 180°. Any PPA blit has to apply the same rotation as `Panel_FrameBufferBase::display()`, including `offset_rotation`, or sprites land mirrored or off-screen.
+
+The backlight sleeps after the interval chosen on the Settings page (off, or 1, 5, 15, 30 minutes; 5 is the default). Sleep is `setBrightness(0)` under the I2C lock. The next touch wakes it and is not treated as a button press. The Tab5 has no vibration motor. A tap plays a 40 ms tone through `M5.Speaker` (ES8388, started once from setup, before the network task). The Screen tab stores the choice: off, 440 Hz, or 880 Hz. The microphone stays off, so the INA226 address is left alone.
 
 There is no LVGL in this project. Drawing is an M5GFX `M5Canvas` sprite, 16-bit, allocated in PSRAM (`setPsram(true)`), then copied into the DSI framebuffer by the Pixel Processing Accelerator.
 

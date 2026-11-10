@@ -10,7 +10,7 @@ constexpr int MAX_ROOMS = 16;
 constexpr int MAX_FAVS = 40;
 
 enum class Cmd : uint8_t {
-    Play, Pause, Next, Prev, Volume, ToggleRoom, LoadFavorites, LoadQueue, PlayFavorite,
+    Play, Pause, Next, Prev, Volume, Mute, ToggleRoom, LoadFavorites, LoadQueue, PlayFavorite,
     JoinRoom, LeaveRoom
 };
 
@@ -32,6 +32,7 @@ struct View {
     bool playing;
     int track;   // 1-based position in the current queue, or 0
     int volume;  // 0-100, or -1 until the first reading
+    bool muted;
     int listGen; // bumps when the room or what it is playing changes
     int roomCount;
     int favCount;

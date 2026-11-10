@@ -516,7 +516,75 @@ void resolveId(const char* id) {
     setStatus("Playing");
 }
 
-void addItem(const char* id, const char* title, const char* channel, int seconds) {
+// "Streamed 2 hours ago" -> "2 hrs". "4 days ago" -> "4 days". Empty when it does not match.
+void shortenAge(const char* in, char* out, size_t cap) {
+    out[0] = 0;
+    if (!in || !in[0] || cap < 8) return;
+    const char* p = in;
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    if (!*p) return;
+    int n = 0;
+    while (isdigit((unsigned char)*p)) {
+        n = n * 10 + (*p - '0');
+        if (n > 9999) n = 9999;
+        p++;
+    }
+    while (*p && !isalpha((unsigned char)*p)) p++;
+    const char* unit = nullptr;
+    if (strncmp(p, "second", 6) == 0) unit = "sec";
+    else if (strncmp(p, "minute", 6) == 0) unit = "min";
+    else if (strncmp(p, "hour", 4) == 0) unit = n == 1 ? "hr" : "hrs";
+    else if (strncmp(p, "day", 3) == 0) unit = n == 1 ? "day" : "days";
+    else if (strncmp(p, "week", 4) == 0) unit = n == 1 ? "wk" : "wks";
+    else if (strncmp(p, "month", 5) == 0) unit = "mo";
+    else if (strncmp(p, "year", 4) == 0) unit = n == 1 ? "yr" : "yrs";
+    if (unit) snprintf(out, cap, "%d %s", n, unit);
+}
+
+// "1,234,567 views" -> "1.2M". "1.2M views" stays "1.2M". Empty when there is no count.
+void shortenViews(const char* in, char* out, size_t cap) {
+    out[0] = 0;
+    if (!in || !in[0] || cap < 4) return;
+    while (*in == ' ') in++;
+    if (!strncmp(in, "No views", 8)) {
+        strlcpy(out, "0", cap);
+        return;
+    }
+    char token[24];
+    size_t n = 0;
+    for (const char* p = in; *p && *p != ' ' && n + 1 < sizeof(token); p++) token[n++] = *p;
+    token[n] = 0;
+    if (!token[0]) return;
+    bool digits = true;
+    long long v = 0;
+    for (const char* p = token; *p; p++) {
+        if (*p == ',') continue;
+        if (!isdigit((unsigned char)*p)) {
+            digits = false;
+            break;
+        }
+        v = v * 10 + (*p - '0');
+    }
+    if (!digits || v < 1000) {
+        strlcpy(out, token, cap);
+        return;
+    }
+    long long div = 1000;
+    char suf = 'K';
+    if (v >= 1000000000LL) {
+        div = 1000000000LL;
+        suf = 'B';
+    } else if (v >= 1000000LL) {
+        div = 1000000LL;
+        suf = 'M';
+    }
+    long long whole = v / div;
+    int tenth = (int)((v % div) / (div / 10));
+    if (tenth) snprintf(out, cap, "%d.%d%c", (int)whole, tenth, suf);
+    else snprintf(out, cap, "%d%c", (int)whole, suf);
+}
+
+void addItem(const char* id, const char* title, const char* channel, int seconds, const char* age, const char* views) {
     if (!videoIdOk(id)) return;
     lock();
     if (published.count >= MAX_ITEMS) {
@@ -530,6 +598,7 @@ void addItem(const char* id, const char* title, const char* channel, int seconds
         }
     }
     Item& it = published.items[published.count++];
+    memset(&it, 0, sizeof(it));
     strlcpy(it.id, id, sizeof(it.id));
     strlcpy(it.title, title && title[0] ? title : id, sizeof(it.title));
     strlcpy(it.channel, channel ? channel : "", sizeof(it.channel));
@@ -537,6 +606,8 @@ void addItem(const char* id, const char* title, const char* channel, int seconds
     cleanText(it.channel);
     if (!it.title[0]) strlcpy(it.title, id, sizeof(it.title));
     it.seconds = seconds;
+    shortenAge(age, it.age, sizeof(it.age));
+    shortenViews(views, it.views, sizeof(it.views));
     unlock();
 }
 
@@ -547,7 +618,10 @@ void takeVideo(JsonObject v) {
     if (!channel[0]) channel = textOf(v["ownerText"]);
     if (!channel[0]) channel = textOf(v["shortBylineText"]);
     const char* length = textOf(v["lengthText"]);
-    addItem(id, title, channel, parseClock(length));
+    const char* age = textOf(v["publishedTimeText"]);
+    const char* views = textOf(v["shortViewCountText"]);
+    if (!views[0]) views = textOf(v["viewCountText"]);
+    addItem(id, title, channel, parseClock(length), age, views);
 }
 
 void takeContents(JsonArray contents) {
@@ -630,6 +704,16 @@ void scanSearch(size_t n) {
         char title[80] = "";
         char channel[48] = "";
         char length[20] = "";
+        char age[40] = "";
+        char views[32] = "";
+        const char* limit = end;
+        for (const char* q = match + 24; q + 24 < end && q < match + 12000; q++) {
+            if (memcmp(q, "\"compactVideoRenderer\"", 23) == 0 || memcmp(q, "\"videoRenderer\"", 15) == 0) {
+                limit = q;
+                break;
+            }
+        }
+        if (limit > match + 12000) limit = match + 12000;
         grab(hit, window, "\"videoId\":\"", id, sizeof(id));
         if (!grab(hit, window, "\"title\":{\"runs\":[{\"text\":\"", title, sizeof(title)))
             grab(hit, window, "\"title\":{\"simpleText\":\"", title, sizeof(title));
@@ -637,7 +721,13 @@ void scanSearch(size_t n) {
             grab(hit, window, "\"ownerText\":{\"runs\":[{\"text\":\"", channel, sizeof(channel));
         if (!grab(hit, window, "\"lengthText\":{\"runs\":[{\"text\":\"", length, sizeof(length)))
             grab(hit, window, "\"lengthText\":{\"simpleText\":\"", length, sizeof(length));
-        if (videoIdOk(id) && title[0]) addItem(id, title, channel, parseClock(length));
+        if (!grab(match, limit, "\"publishedTimeText\":{\"simpleText\":\"", age, sizeof(age)))
+            grab(match, limit, "\"publishedTimeText\":{\"runs\":[{\"text\":\"", age, sizeof(age));
+        if (!grab(match, limit, "\"shortViewCountText\":{\"simpleText\":\"", views, sizeof(views)))
+            if (!grab(match, limit, "\"viewCountText\":{\"simpleText\":\"", views, sizeof(views)))
+                if (!grab(match, limit, "\"shortViewCountText\":{\"runs\":[{\"text\":\"", views, sizeof(views)))
+                    grab(match, limit, "\"viewCountText\":{\"runs\":[{\"text\":\"", views, sizeof(views));
+        if (videoIdOk(id) && title[0]) addItem(id, title, channel, parseClock(length), age, views);
         p = match + 11;
     }
     const char* found = strstr(begin, "continuationCommand");
@@ -1448,8 +1538,14 @@ void runSearch(bool more) {
     published.loading = false;
     if (n == 0) strlcpy(published.status, "Nothing found", sizeof(published.status));
     else published.status[0] = 0;
+    char age0[16] = "";
+    char views0[16] = "";
+    if (n > 0) {
+        strlcpy(age0, published.items[0].age, sizeof(age0));
+        strlcpy(views0, published.items[0].views, sizeof(views0));
+    }
     unlock();
-    Serial.printf("[yt] search rows %d more %d\n", n, continuation[0] != 0);
+    Serial.printf("[yt] search rows %d more %d age '%s' views '%s'\n", n, continuation[0] != 0, age0, views0);
 }
 
 // ---- Starred videos -------------------------------------------------------------------------
@@ -1459,7 +1555,8 @@ struct Thumb {
     size_t len;
     uint32_t retryAt;
 };
-Thumb thumbs[MAX_STARS];
+constexpr int MAX_THUMBS = MAX_STARS + MAX_ITEMS;
+Thumb thumbs[MAX_THUMBS];
 bool starsDirty = false;
 
 class ThumbSink : public Stream {
@@ -1481,6 +1578,8 @@ class ThumbSink : public Stream {
     void flush() override {}
 };
 
+static_assert(offsetof(Item, seconds) + sizeof(int) == 148, "legacy starred record size");
+
 void loadStars() {
     Preferences prefs;
     if (!prefs.begin("ytstar", true)) return;
@@ -1490,8 +1589,11 @@ void loadStars() {
     for (int i = 0; i < n; i++) {
         char key[8];
         snprintf(key, sizeof(key), "s%d", i);
-        Item it;
-        if (prefs.getBytes(key, &it, sizeof(it)) != sizeof(it)) continue;
+        Item it{};
+        // Stars saved before age and views were added are the bytes up through seconds.
+        constexpr size_t kLegacyItem = 148;
+        size_t bytes = prefs.getBytes(key, &it, sizeof(it));
+        if (bytes != sizeof(it) && bytes != kLegacyItem) continue;
         it.id[sizeof(it.id) - 1] = 0;
         it.title[sizeof(it.title) - 1] = 0;
         it.channel[sizeof(it.channel) - 1] = 0;
@@ -1564,13 +1666,21 @@ bool fetchThumb(Thumb& t) {
 }
 
 // Network task, when nothing else is running: save changes and download missing thumbnails.
+// Starred videos come first, then the videos on the current search page.
 void serviceStars() {
     if (starsDirty) saveStars();
-    char ids[MAX_STARS][16];
-    int n;
+    char ids[MAX_THUMBS][16];
+    int n = 0;
     lock();
-    n = published.starCount;
-    for (int i = 0; i < n; i++) strlcpy(ids[i], published.stars[i].id, sizeof(ids[i]));
+    for (int i = 0; i < published.starCount && n < MAX_THUMBS; i++)
+        strlcpy(ids[n++], published.stars[i].id, sizeof(ids[0]));
+    for (int i = 0; i < published.count && n < MAX_THUMBS; i++) {
+        bool seen = false;
+        for (int j = 0; j < n; j++)
+            if (!strcmp(ids[j], published.items[i].id)) seen = true;
+        if (seen || !published.items[i].id[0]) continue;
+        strlcpy(ids[n++], published.items[i].id, sizeof(ids[0]));
+    }
     unlock();
     for (Thumb& t : thumbs) {
         if (!t.id[0]) continue;
@@ -1585,8 +1695,7 @@ void serviceStars() {
         t.id[0] = 0;
         unlock();
     }
-    static uint32_t lastFetch = 0;
-    if (millis() - lastFetch < 300) return;
+    int fetched = 0;
     for (int i = 0; i < n; i++) {
         Thumb* slot = nullptr;
         for (Thumb& t : thumbs)
@@ -1605,9 +1714,8 @@ void serviceStars() {
             }
         }
         if (!slot || slot->len || (int32_t)(millis() - slot->retryAt) < 0) continue;
-        lastFetch = millis();
         if (!fetchThumb(*slot)) slot->retryAt = millis() + 20000;
-        return;
+        if (++fetched >= 3) return;
     }
 }
 

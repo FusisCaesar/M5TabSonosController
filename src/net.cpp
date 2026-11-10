@@ -241,6 +241,8 @@ const char* ssid() { return currentSsid.c_str(); }
 
 const char* localIp() { return ipText; }
 
+int rssi() { return connected() ? WiFi.RSSI() : 0; }
+
 void startSetup(Print& out) {
     if (server) return;
     snprintf(apName, sizeof(apName), "TabSonos-%04X", (unsigned)(ESP.getEfuseMac() & 0xFFFF));

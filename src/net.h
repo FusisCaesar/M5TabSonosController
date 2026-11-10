@@ -23,6 +23,7 @@ State state();
 bool connected();
 const char* ssid();
 const char* localIp();
+int rssi();
 
 void startSetup(Print& out);
 void stopSetup();
