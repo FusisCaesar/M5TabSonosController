@@ -34,6 +34,7 @@ constexpr const char* CD_PATH = "/MediaServer/ContentDirectory/Control";
 struct Command {
     Cmd type;
     int value;
+    int extra;
     char text[40];
 };
 
@@ -44,6 +45,7 @@ struct Room {
     char ip[16];
     bool coordinator;
     bool playing;
+    int volume;  // -1 until read
 };
 
 struct Fav {
@@ -131,6 +133,17 @@ uint32_t statusUntil = 0;
 uint32_t volumeHoldUntil = 0;
 uint32_t muteHoldUntil = 0;
 int heldVolume = 0;
+char roomHold[40] = "";
+int roomHoldVol = -1;
+uint32_t roomHoldUntil = 0;
+struct VolSnap {
+    char uuid[40];
+    int vol;
+};
+VolSnap groupSnap[MAX_ROOMS];
+int groupSnapN = 0;
+int groupAnchor = 0;
+char groupGesture[16] = "";
 int playFails = 0;
 int topoFails = 0;
 
@@ -583,6 +596,7 @@ void publishRooms() {
         dst.leader = rooms[i].coordinator;
         dst.playing = rooms[i].playing;
         dst.coordinator = strcmp(rooms[i].uuid, active) == 0;
+        dst.volume = rooms[i].volume;
         if (dst.coordinator)
             strlcpy(published.groupName, rooms[i].name, sizeof(published.groupName));
     }
@@ -623,8 +637,20 @@ bool parseGroups(char* xml) {
         p = end + 12;
     }
     if (!n) return false;
+    char keepId[MAX_ROOMS][40];
+    int keepVol[MAX_ROOMS];
+    int keepN = roomCount;
+    for (int i = 0; i < keepN; i++) {
+        strlcpy(keepId[i], rooms[i].uuid, sizeof(keepId[i]));
+        keepVol[i] = rooms[i].volume;
+    }
     memcpy(rooms, scratch, sizeof(Room) * n);
     roomCount = n;
+    for (int i = 0; i < roomCount; i++) {
+        rooms[i].volume = -1;
+        for (int k = 0; k < keepN; k++)
+            if (!strcmp(rooms[i].uuid, keepId[k])) rooms[i].volume = keepVol[k];
+    }
     return true;
 }
 
@@ -934,6 +960,16 @@ void considerArt(const char* uri, const char* ip) {
     bool png = got >= 8 && art[back][0] == 0x89 && art[back][1] == 'P' && art[back][2] == 'N' && art[back][3] == 'G';
     bool ok = code == 200 && written > 0 && (jpeg || png);
     http.end();
+    if (!ok && strstr(url, "/hq720.jpg")) {
+        // Some videos have no 720p frame. The 480p one is still far sharper than the list thumbnail.
+        char* d = strstr(directArt, "/hq720.jpg");
+        if (d && strlen(directArt) + 4 < sizeof(directArt)) {
+            memmove(d + 15, d + 11, strlen(d + 11) + 1);
+            memcpy(d, "/hqdefault.jpg", 15);
+            Serial.println("[sonos] art falling back to hqdefault");
+            return;
+        }
+    }
     if (!ok) {
         artRetryAt = millis() + 15000;
         unsigned m0 = got ? art[back][0] : 0;
@@ -1159,12 +1195,23 @@ bool getPosition(const char* ip) {
         pickArt(trackBuf, pickedArt, sizeof(pickedArt));
     }
     classifySource(trackUri[0] ? trackUri : pickedArt, source, sizeof(source));
-    if (directTitle[0] && strstr(trackUri, ":8080/yt/")) {
-        strlcpy(title, directTitle, sizeof(title));
-        strlcpy(artist, directArtist, sizeof(artist));
-        album[0] = 0;
+    if (strstr(trackUri, ":8080/yt/")) {
+        if (directTitle[0]) {
+            strlcpy(title, directTitle, sizeof(title));
+            strlcpy(artist, directArtist, sizeof(artist));
+            album[0] = 0;
+        }
         strlcpy(source, "YouTube", sizeof(source));
-        strlcpy(pickedArt, directArt, sizeof(pickedArt));
+        if (!directArt[0]) {
+            Preferences prefs;
+            if (prefs.begin("yt", true)) {
+                String id = prefs.getString("id");
+                if (id.length() >= 6 && id.length() < 16)
+                    snprintf(directArt, sizeof(directArt), "http://i.ytimg.com/vi/%s/hq720.jpg", id.c_str());
+                prefs.end();
+            }
+        }
+        if (directArt[0]) strlcpy(pickedArt, directArt, sizeof(pickedArt));
     }
     if (strcmp(title, lastTitle) != 0) {
         Serial.printf("[sonos] now '%s' / '%s' art %u\n", title, artist, (unsigned)strlen(pickedArt));
@@ -1251,6 +1298,55 @@ bool writeMute(const char* ip, bool muted) {
     });
 }
 
+// The home slider is one control for every room that is playing together.
+template <typename F>
+bool eachInGroup(Room* seed, F fn) {
+    if (!seed) return false;
+    const char* gid = seed->group[0] ? seed->group : seed->uuid;
+    bool any = false;
+    bool ok = false;
+    for (int i = 0; i < roomCount; i++) {
+        Room* r = &rooms[i];
+        if (!r->ip[0]) continue;
+        if (gid[0] && strcmp(r->group, gid) != 0 && strcmp(r->uuid, gid) != 0) continue;
+        any = true;
+        if (fn(r)) ok = true;
+    }
+    if (!any) return fn(seed);
+    return ok;
+}
+
+void rememberVolume(Room* r, int vol) {
+    if (!r) return;
+    if (roomHold[0] && !strcmp(r->uuid, roomHold) && millis() < roomHoldUntil) vol = roomHoldVol;
+    r->volume = vol;
+    lock();
+    for (int i = 0; i < published.roomCount; i++)
+        if (!strcmp(published.rooms[i].uuid, r->uuid)) published.rooms[i].volume = vol;
+    unlock();
+}
+
+// A few grouped rooms per pass, so the playback poll is not stuck reading every speaker.
+void pollGroupedVolumes() {
+    int grouped[MAX_ROOMS];
+    int n = 0;
+    for (int i = 0; i < roomCount; i++) {
+        bool share = false;
+        for (int j = 0; j < roomCount; j++)
+            if (j != i && rooms[i].group[0] && !strcmp(rooms[j].group, rooms[i].group)) share = true;
+        if (share) grouped[n++] = i;
+    }
+    if (!n) return;
+    static int cursor = 0;
+    int reads = n < 2 ? n : 2;
+    for (int k = 0; k < reads; k++) {
+        Room* r = &rooms[grouped[cursor % n]];
+        cursor++;
+        int vol = -1;
+        if (readVolume(r->ip, &vol)) rememberVolume(r, vol);
+    }
+}
+
 void applyPlaying(const char* groupUuid, bool on) {
     if (!groupUuid || !groupUuid[0]) return;
     for (int i = 0; i < roomCount; i++)
@@ -1318,11 +1414,13 @@ bool refreshPlayback() {
         bool gotVol = volRoom && readVolume(volRoom->ip, &vol);
         bool muted = false;
         bool gotMute = volRoom && readMute(volRoom->ip, &muted);
+        if (gotVol) rememberVolume(volRoom, vol);
         lock();
         published.playing = false;
         if (gotVol && millis() >= volumeHoldUntil) published.volume = vol;
         if (gotMute && millis() >= muteHoldUntil) published.muted = muted;
         unlock();
+        pollGroupedVolumes();
         return true;
     }
     if (!getPosition(c->ip)) return false;
@@ -1383,11 +1481,13 @@ bool refreshPlayback() {
     bool gotVol = volRoom && readVolume(volRoom->ip, &vol);
     bool muted = false;
     bool gotMute = volRoom && readMute(volRoom->ip, &muted);
+    if (gotVol) rememberVolume(volRoom, vol);
     lock();
     if (gotState) published.playing = playing;
     if (gotVol && millis() >= volumeHoldUntil) published.volume = vol;
     if (gotMute && millis() >= muteHoldUntil) published.muted = muted;
     unlock();
+    pollGroupedVolumes();
     return true;
 }
 
@@ -2156,6 +2256,23 @@ void selectRoom(const char* uuid) {
     Serial.printf("[sonos] selected '%s'\n", r->name);
 }
 
+void snapshotGroup(Room* seed, int anchor) {
+    groupSnapN = 0;
+    groupAnchor = anchor;
+    if (!seed) return;
+    const char* gid = seed->group[0] ? seed->group : seed->uuid;
+    for (int i = 0; i < roomCount && groupSnapN < MAX_ROOMS; i++) {
+        Room* r = &rooms[i];
+        if (!r->ip[0]) continue;
+        if (gid[0] && strcmp(r->group, gid) != 0 && strcmp(r->uuid, gid) != 0) continue;
+        strlcpy(groupSnap[groupSnapN].uuid, r->uuid, sizeof(groupSnap[groupSnapN].uuid));
+        int base = r->volume;
+        if (base < 0 || (active[0] && !strcmp(r->uuid, active))) base = anchor;
+        groupSnap[groupSnapN].vol = base;
+        groupSnapN++;
+    }
+}
+
 void handle(const Command& cmd) {
     Room* c = transportRoom();
     Room* volRoom = coord();
@@ -2188,6 +2305,14 @@ void handle(const Command& cmd) {
             int vol = cmd.value;
             if (vol < 0) vol = 0;
             if (vol > 100) vol = 100;
+            int anchor = cmd.extra;
+            if (anchor < 0) anchor = vol;
+            if (anchor > 100) anchor = 100;
+            // One finger-down keeps the gaps between rooms. The next touch measures them again.
+            if (!cmd.text[0] || strcmp(cmd.text, groupGesture) != 0 || groupSnapN == 0)
+                snapshotGroup(volRoom, anchor);
+            if (cmd.text[0]) strlcpy(groupGesture, cmd.text, sizeof(groupGesture));
+            int delta = vol - groupAnchor;
             heldVolume = vol;
             volumeHoldUntil = millis() + 2500;
             lock();
@@ -2198,8 +2323,42 @@ void handle(const Command& cmd) {
                 muteHoldUntil = millis() + 2500;
             }
             unlock();
-            if (!volRoom || !writeVolume(volRoom->ip, vol)) setStatus("Volume failed");
-            else if (wasMuted && !writeMute(volRoom->ip, false)) setStatus("Mute failed");
+            roomHold[0] = 0;
+            bool wrote = false;
+            for (int i = 0; i < groupSnapN; i++) {
+                Room* r = findRoom(groupSnap[i].uuid);
+                if (!r) continue;
+                int next = groupSnap[i].vol + delta;
+                if (next < 0) next = 0;
+                if (next > 100) next = 100;
+                rememberVolume(r, next);
+                if (writeVolume(r->ip, next)) wrote = true;
+            }
+            if (!wrote) setStatus("Volume failed");
+            else if (wasMuted && !eachInGroup(volRoom, [&](Room* r) { return writeMute(r->ip, false); }))
+                setStatus("Mute failed");
+            break;
+        }
+        case Cmd::RoomVolume: {
+            groupGesture[0] = 0;
+            groupSnapN = 0;
+            Room* one = findRoom(cmd.text);
+            if (!one) return;
+            int vol = cmd.value;
+            if (vol < 0) vol = 0;
+            if (vol > 100) vol = 100;
+            strlcpy(roomHold, one->uuid, sizeof(roomHold));
+            roomHoldVol = vol;
+            roomHoldUntil = millis() + 2500;
+            rememberVolume(one, vol);
+            if (!strcmp(one->uuid, active)) {
+                heldVolume = vol;
+                volumeHoldUntil = millis() + 2500;
+                lock();
+                published.volume = vol;
+                unlock();
+            }
+            if (!writeVolume(one->ip, vol)) setStatus("Volume failed");
             break;
         }
         case Cmd::Mute: {
@@ -2208,7 +2367,7 @@ void handle(const Command& cmd) {
             lock();
             published.muted = muted;
             unlock();
-            if (!volRoom || !writeMute(volRoom->ip, muted)) setStatus("Mute failed");
+            if (!eachInGroup(volRoom, [&](Room* r) { return writeMute(r->ip, muted); })) setStatus("Mute failed");
             break;
         }
         case Cmd::ToggleRoom:
@@ -2298,7 +2457,13 @@ bool playDirect(const char* uri, const char* title) {
         "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
         "<item id=\"yt\" parentID=\"-1\" restricted=\"true\"><dc:title>");
     d.xml(title && title[0] ? title : "YouTube");
-    d.s("</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+    d.s("</dc:title>");
+    if (directArt[0]) {
+        d.s("<upnp:albumArtURI>");
+        d.xml(directArt);
+        d.s("</upnp:albumArtURI>");
+    }
+    d.s("<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
         "<res protocolInfo=\"x-rincon-mp3radio:*:*:*\">");
     d.xml(uri);
     d.s("</res></item></DIDL-Lite>");
@@ -2411,11 +2576,12 @@ void loop() {
     }
 }
 
-void command(Cmd cmd, int value, const char* text) {
+void command(Cmd cmd, int value, const char* text, int extra) {
     if (!q) return;
     Command c;
     c.type = cmd;
     c.value = value;
+    c.extra = extra;
     strlcpy(c.text, text ? text : "", sizeof(c.text));
     if (xQueueSend(q, &c, 0) != pdTRUE) Serial.println("[sonos] command queue full");
 }

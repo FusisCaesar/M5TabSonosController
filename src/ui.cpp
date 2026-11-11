@@ -61,6 +61,8 @@ constexpr Box STAR_NOW{1210, 136, 46, 46};  // star beside the title while YouTu
 
 M5Canvas canvas;
 M5Canvas art;
+M5Canvas coverPic;  // the playing picture at cover size, so it is not a blown-up thumbnail
+int coverGen = -1;
 uint8_t* jpg = nullptr;
 constexpr size_t JPG_CAP = 1024 * 1024;
 bool ready = false;
@@ -81,9 +83,18 @@ int favScroll = 0;
 bool pressing = false;
 bool moved = false;
 int x0 = 0, y0 = 0, lastY = 0, scroll0 = 0;
-enum class Drag : uint8_t { None, Rooms, Favs, Volume };
+enum class Drag : uint8_t { None, Rooms, Favs, Volume, RoomVol };
 Drag drag = Drag::None;
 int localVol = 0;
+int roomDrag = -1;
+int roomLocal = 0;
+char roomHoldId[40] = "";
+uint32_t roomHoldUntil = 0;
+uint32_t lastRoomSend = 0;
+int volAnchor = 0;
+int volGesture = 0;
+bool showRoomVols = false;
+uint32_t roomVolsUntil = 0;
 bool freezeVol = false;
 uint32_t volFreezeUntil = 0;
 uint32_t lastVolSend = 0;
@@ -93,7 +104,9 @@ int flashX = 0, flashY = 0;
 uint32_t lastActivity = 0;
 int sleepMin = 5;
 int clickLevel = 1;  // 0 off, 1 low, 2 high
+bool showCover = true;  // plugged in, show the playing picture instead of turning the backlight off
 bool asleep = false;
+bool coverMode = false;
 bool swallowTouch = false;
 bool speakerReady = false;
 
@@ -134,11 +147,19 @@ void startSpeaker() {
 struct PowerView {
     bool known = false;
     bool onUsb = false;
+    bool onExternal = false;  // USB with no pack, or a pack that is being charged
     bool charging = false;
+    bool packLatched = false;
     int pct = -1;
     int mv = 0;
     int ma = 0;
-    int packSamples = 0;
+    int midSamples = 0;
+    int highSamples = 0;
+    int lowSamples = 0;
+    int chargeOn = 0;
+    int chargeOff = 0;
+    int extOn = 0;
+    int extOff = 0;
 } power;
 
 int cellPercent(int packMv) {
@@ -149,35 +170,127 @@ int cellPercent(int packMv) {
     return p;
 }
 
+void notePack(int mv) {
+    power.packLatched = true;
+    power.onUsb = false;
+    power.pct = cellPercent(mv);
+    power.lowSamples = 0;
+}
+
+void forgetPack() {
+    power.packLatched = false;
+    power.onUsb = true;
+    power.pct = -1;
+    power.charging = false;
+    power.chargeOn = 0;
+    power.lowSamples = 0;
+    power.highSamples = 0;
+    power.midSamples = 0;
+}
+
 void servicePower() {
     static uint32_t next = 0;
     if (millis() < next) return;
     next = millis() + 5000;
     int mv = 0, ma = 0;
-    bool charging = false;
     {
         board::I2CLock lock;
         mv = M5.Power.getBatteryVoltage();
         ma = M5.Power.getBatteryCurrent();
-        charging = M5.Power.isCharging();
     }
+    power.known = true;
+    // A failed read comes back as 0 and used to flip a plugged-in pack over to "USB" for one sample.
+    if (mv <= 0 || mv > 20000) {
+        if (!power.packLatched) {
+            power.midSamples = 0;
+            power.highSamples = 0;
+        }
+        return;
+    }
+    bool prevUsb = power.onUsb;
+    bool prevChg = power.charging;
+    bool prevExt = power.onExternal;
+    int prevMv = power.mv;
     power.mv = mv;
     power.ma = ma;
-    power.charging = charging;
-    power.known = true;
-    // The fuel gauge sits on the charger rail when no pack is fitted, so a single high reading is
-    // not a battery. The thresholds are the ones that settled on this board.
-    if (mv >= 6000 && mv <= 8800) {
-        power.packSamples++;
-        if (power.packSamples >= 2) {
-            power.onUsb = false;
-            power.pct = cellPercent(mv);
+
+    // Handover thresholds. Below 5.5 V is USB with no pack. 6.0–8.1 V is a real 2S pack.
+    // At or above 8.1 V the empty bay floats on the charger rail, and the charger can push a
+    // little current into that empty node. With no pack the reading also flips to about 4.2 V.
+    // That swing is not a battery. A steady full pack does not do it.
+    bool low = mv < 5500;
+    bool mid = mv >= 6000 && mv < 8100;
+    bool high = mv >= 8100 && mv <= 8800;
+    bool packHere = ma < -40 || ma > 80;
+    int swing = mv - prevMv;
+    if (swing < 0) swing = -swing;
+    bool emptyFlip = power.packLatched && prevMv > 1000 && swing > 3000 &&
+                     ((low && prevMv >= 6000) || (mv >= 6000 && prevMv < 5500));
+    if (emptyFlip) forgetPack();
+    if (mid) {
+        power.lowSamples = 0;
+        power.highSamples = 0;
+        power.midSamples++;
+        if (power.packLatched || power.midSamples >= 2) notePack(mv);
+    } else if (high) {
+        power.midSamples = 0;
+        if (power.packLatched && power.lowSamples > 0 && !packHere) {
+            // A collapse already happened. The rail reading is the empty bay, not a full pack.
+            forgetPack();
+        } else if (power.packLatched) {
+            notePack(mv);
+        } else if (packHere) {
+            // Leaving the pack, or a real charge into it. The empty bay only leaks a little.
+            power.highSamples++;
+            if (power.highSamples >= 2) notePack(mv);
+        } else {
+            power.highSamples = 0;
+            power.onUsb = true;
+            power.pct = -1;
         }
-    } else if (mv < 5500) {
-        power.onUsb = true;
-        power.pct = -1;
-        power.packSamples = 0;
+    } else if (low) {
+        power.midSamples = 0;
+        power.highSamples = 0;
+        power.lowSamples++;
+        int need = power.packLatched ? 3 : 1;
+        if (power.lowSamples >= need) forgetPack();
+    } else if (!power.packLatched) {
+        power.midSamples = 0;
+        power.highSamples = 0;
     }
+
+    // Tab5 isCharging() is only "current above 10 mA". The empty bay clears that, so the
+    // icon says charging only for a pack that is actually taking current.
+    if (power.packLatched && ma > 40) {
+        power.chargeOn++;
+        power.chargeOff = 0;
+    } else {
+        power.chargeOff++;
+        power.chargeOn = 0;
+    }
+    if (power.chargeOn >= 2) power.charging = true;
+    if (power.chargeOff >= 2) power.charging = false;
+
+    // Plugged in: no pack on USB, a pack that is taking charge, or current flowing in.
+    // A pack that is only discharging is battery, and the screen then sleeps.
+    // A full pack on the charger sits near 0 mA. With the backlight on, a battery would be
+    // discharging, so a pack that is not discharging is on external power.
+    bool screenLit = !asleep;
+    bool extSample = power.onUsb || power.charging || ma > 40;
+    if (screenLit && power.packLatched && ma > -100) extSample = true;
+    if (extSample) {
+        power.extOn++;
+        power.extOff = 0;
+    } else {
+        power.extOff++;
+        power.extOn = 0;
+    }
+    if (power.extOn >= 2) power.onExternal = true;
+    if (power.extOff >= 2) power.onExternal = false;
+    if (prevExt != power.onExternal || prevUsb != power.onUsb || prevChg != power.charging)
+        Serial.printf("[ui] power %s %d mV %d mA %s\n", power.onUsb ? "usb" : "pack", mv, ma,
+                      power.onExternal ? "external" : "battery");
+    if (!power.packLatched || power.lowSamples > 0) next = millis() + 2000;
 }
 
 // Both landscape rotations are the same 1280x720 layout, so the canvas stays. Held on its short edge,
@@ -255,16 +368,39 @@ void setBrightness(int level) {
 
 void wakeScreen() {
     asleep = false;
+    coverMode = false;
     lastActivity = millis();
     setBrightness(200);
 }
 
+bool coverArtReady();
+void drawCover(M5Canvas& c);
+
+// On battery the backlight always turns off. Plugged in, the cover can stay up instead.
+bool wantCover() {
+    return showCover && power.known && power.onExternal && coverArtReady();
+}
+
 void serviceSleep() {
     if (sleepMin <= 0) {
-        if (asleep) wakeScreen();
+        if (asleep || coverMode) wakeScreen();
         return;
     }
-    if (!asleep && lastActivity && millis() - lastActivity > (uint32_t)sleepMin * 60000UL) {
+    bool idle = lastActivity && millis() - lastActivity > (uint32_t)sleepMin * 60000UL;
+    if (!idle) return;
+    if (wantCover()) {
+        if (asleep) {
+            asleep = false;
+            setBrightness(200);
+        }
+        if (!coverMode) {
+            coverMode = true;
+            Serial.println("[ui] showing the cover");
+        }
+        return;
+    }
+    if (coverMode || !asleep) {
+        coverMode = false;
         asleep = true;
         setBrightness(0);
         Serial.printf("[ui] screen off after %d min\n", sleepMin);
@@ -276,6 +412,7 @@ void loadSleep() {
     prefs.begin("ui", true);
     int saved = prefs.getInt("sleep", 5);
     int click = prefs.getInt("click", 1);
+    showCover = prefs.getInt("cover", 1) != 0;
     prefs.end();
     if (saved == 0 || saved == 1 || saved == 5 || saved == 15 || saved == 30) sleepMin = saved;
     if (click >= 0 && click <= 2) clickLevel = click;
@@ -288,6 +425,16 @@ void storeSleep(int minutes) {
     prefs.begin("ui", false);
     prefs.putInt("sleep", minutes);
     prefs.end();
+}
+
+void storeCover(bool on) {
+    showCover = on;
+    lastActivity = millis();
+    Preferences prefs;
+    prefs.begin("ui", false);
+    prefs.putInt("cover", on ? 1 : 0);
+    prefs.end();
+    if (!on && coverMode) wakeScreen();
 }
 
 void storeClick(int level) {
@@ -304,13 +451,37 @@ char wifiSsid[33] = "";
 char wifiPass[65] = "";
 int wifiField = 0;  // 1 network name, 2 password
 
+bool batteryShown() {
+    return power.known && power.packLatched && !power.onUsb && power.pct >= 0;
+}
+
+// The header icons sit just left of the battery. With no pack they take its place.
+Box placeHeader(const Box& b) {
+    Box o = b;
+    if (!batteryShown()) o.x += (BATT_X + 48) - (SET.x + SET.w);
+    return o;
+}
+
+void drawBolt(M5Canvas& c, int cx, int cy, uint16_t col) {
+    c.fillTriangle(cx + 2, cy - 6, cx - 5, cy, cx + 1, cy, col);
+    c.fillTriangle(cx - 2, cy - 1, cx + 5, cy - 1, cx - 1, cy + 6, col);
+}
+
 void drawBattery(M5Canvas& c, int x, int y) {
+    // USB with no pack is not a battery, so the icon stays off.
+    if (!batteryShown()) return;
     c.drawRoundRect(x, y, 44, 22, 3, COL_TEXT);
     c.fillRoundRect(x + 44, y + 6, 4, 10, 1, COL_TEXT);
-    if (!power.known || power.onUsb || power.pct < 0) return;
     int fill = 36 * power.pct / 100;
-    uint16_t col = power.pct < 15 ? COL_WARN : (power.charging ? COL_ACCENT : COL_TEXT);
+    uint16_t col = power.pct < 15 ? COL_WARN : COL_TEXT;
     if (fill > 0) c.fillRoundRect(x + 3, y + 3, fill, 16, 2, col);
+    if (!power.charging) return;
+    int cx = x + 20;
+    int cy = y + 11;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            if (dx || dy) drawBolt(c, cx + dx, cy + dy, COL_BG);
+    drawBolt(c, cx, cy, COL_ACCENT);
 }
 
 void drawSpeakerGlyph(M5Canvas& c, int x, int y, uint16_t body, uint16_t hole) {
@@ -383,6 +554,7 @@ int listMax(int count, int viewH, int row) {
 constexpr int ROOM_GAP = 10;
 constexpr int ROOM_SOLO = ROW_H - ROOM_GAP;
 constexpr int ROOM_MEMBER = 64;
+constexpr int ROOM_MEMBER_VOL = 104;
 int roomTop[sonos::MAX_ROOMS];
 int roomH[sonos::MAX_ROOMS];
 int roomsContent = 0;
@@ -401,7 +573,7 @@ void layoutRooms() {
     int i = 0;
     while (i < view.roomCount && i < sonos::MAX_ROOMS) {
         int n = groupRun(i);
-        int slice = n == 1 ? ROOM_SOLO : ROOM_MEMBER;
+        int slice = n == 1 ? ROOM_SOLO : (showRoomVols ? ROOM_MEMBER_VOL : ROOM_MEMBER);
         for (int k = 0; k < n; k++) {
             roomTop[i + k] = roomsContent + k * slice;
             roomH[i + k] = slice;
@@ -441,7 +613,31 @@ void roomActionBox(int i, int* x, int* y, int* w, int* h) {
     *w = 44;
     *h = 44;
     *x = LIST_X + LIST_W - 60;
-    *y = rowY + (roomH[i] - *h) / 2;
+    *y = view.rooms[i].inGroup && showRoomVols ? rowY + 8 : rowY + (roomH[i] - *h) / 2;
+}
+
+bool groupPlaying(int i) {
+    if (i < 0 || i >= view.roomCount) return false;
+    int start = i;
+    while (start > 0 && view.rooms[start].inGroup && view.rooms[start - 1].inGroup &&
+           !strcmp(view.rooms[start].group, view.rooms[start - 1].group))
+        start--;
+    int n = groupRun(start);
+    for (int k = 0; k < n; k++)
+        if (view.rooms[start + k].playing) return true;
+    return false;
+}
+
+// The thin slider under a grouped room's name. Solo rooms use the main slider.
+bool roomSliderGeom(int i, int* x, int* y, int* w, int* h) {
+    if (!showRoomVols || i < 0 || i >= view.roomCount || !view.rooms[i].inGroup) return false;
+    int rowY = LIST_Y + roomTop[i] - roomScroll;
+    *x = LIST_X + 36;
+    *h = 32;
+    *y = rowY + roomH[i] - 40;
+    int right = LIST_X + LIST_W - (groupPlaying(i) ? 116 : 72);
+    *w = right - *x;
+    return *w >= 48;
 }
 
 bool roomActionAt(int x, int y, int* idx) {
@@ -494,9 +690,10 @@ void drawHomeHeader(M5Canvas& c, const char* label, bool muted) {
     c.setFont(&fontUi);
     c.setTextDatum(TL_DATUM);
     int y = HOME.y + (HOME.h - c.fontHeight()) / 2;
-    text(c, label, 104, y, BROWSE.x - 120, muted ? COL_MUTED : COL_TEXT);
+    int browseX = placeHeader(BROWSE).x;
+    text(c, label, 104, y, browseX - 120, muted ? COL_MUTED : COL_TEXT);
     int right = 104 + c.textWidth(label ? label : "");
-    homeNameRight = right < BROWSE.x - 16 ? right : BROWSE.x - 16;
+    homeNameRight = right < browseX - 16 ? right : browseX - 16;
 }
 
 bool homeHit(int x, int y) {
@@ -604,10 +801,24 @@ void shortClock(const char* t, char* out, size_t n) {
     }
 }
 
+void formatSeconds(int seconds, char* out, size_t n) {
+    if (seconds < 0) seconds = 0;
+    int h = seconds / 3600;
+    int m = (seconds % 3600) / 60;
+    int s = seconds % 60;
+    if (h) snprintf(out, n, "%d:%02d:%02d", h, m, s);
+    else snprintf(out, n, "%d:%02d", m, s);
+}
+
 int displayVolume() {
     if (drag == Drag::Volume || (freezeVol && millis() < volFreezeUntil)) return localVol;
     if (view.volume < 0) return 0;
     return view.volume;
+}
+
+void revealRoomVols() {
+    showRoomVols = true;
+    roomVolsUntil = millis() + 8000;
 }
 
 void sendVolume(int vol, bool force) {
@@ -616,9 +827,53 @@ void sendVolume(int vol, bool force) {
     localVol = vol;
     freezeVol = true;
     volFreezeUntil = millis() + 2500;
+    roomHoldId[0] = 0;
+    revealRoomVols();
     if (!force && millis() - lastVolSend < 120) return;
     lastVolSend = millis();
-    sonos::command(sonos::Cmd::Volume, vol, nullptr);
+    char gesture[12];
+    snprintf(gesture, sizeof(gesture), "%d", volGesture);
+    sonos::command(sonos::Cmd::Volume, vol, gesture, volAnchor);
+}
+
+int shownRoomVol(int i, bool* known) {
+    if (roomHoldId[0] && !strcmp(view.rooms[i].uuid, roomHoldId) && millis() < roomHoldUntil) {
+        if (known) *known = true;
+        return roomLocal;
+    }
+    int v = view.rooms[i].volume;
+    if (known) *known = v >= 0;
+    return v < 0 ? 0 : v;
+}
+
+void sendRoomVol(int i, int vol, bool force) {
+    if (i < 0 || i >= view.roomCount) return;
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    roomDrag = i;
+    roomLocal = vol;
+    strlcpy(roomHoldId, view.rooms[i].uuid, sizeof(roomHoldId));
+    roomHoldUntil = millis() + 2500;
+    if (view.rooms[i].coordinator) {
+        localVol = vol;
+        freezeVol = true;
+        volFreezeUntil = millis() + 2500;
+    }
+    revealRoomVols();
+    if (!force && millis() - lastRoomSend < 120) return;
+    lastRoomSend = millis();
+    sonos::command(sonos::Cmd::RoomVolume, vol, view.rooms[i].uuid);
+}
+
+int roomVolFromX(int i, int x) {
+    int sx, sy, sw, sh;
+    if (!roomSliderGeom(i, &sx, &sy, &sw, &sh)) return 0;
+    int bar = sw - 44;
+    if (bar < 1) bar = 1;
+    int vol = (x - sx) * 100 / bar;
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    return vol;
 }
 
 void drawTransportIcon(M5Canvas& c, const Box& b, char kind, uint16_t col) {
@@ -629,6 +884,8 @@ void drawTransportIcon(M5Canvas& c, const Box& b, char kind, uint16_t col) {
     } else if (kind == 's') {
         c.fillRoundRect(cx - 20, cy - 20, 12, 40, 3, col);
         c.fillRoundRect(cx + 8, cy - 20, 12, 40, 3, col);
+    } else if (kind == 'q') {
+        c.fillRoundRect(cx - 16, cy - 16, 32, 32, 4, col);
     } else if (kind == '<') {
         c.fillRoundRect(cx - 22, cy - 16, 8, 32, 2, col);
         c.fillTriangle(cx + 20, cy - 16, cx + 20, cy + 16, cx - 10, cy, col);
@@ -697,7 +954,7 @@ void drawWifi(M5Canvas& c) {
         centerLine(c, "Waiting for Wi-Fi", statusY, COL_MUTED);
     }
     drawBattery(c, BATT_X, BATT_Y);
-    drawHeaderButton(c, SET, 3, false);
+    drawHeaderButton(c, placeHeader(SET), 3, false);
 }
 
 const char* kindName(svc::Kind kind) {
@@ -760,6 +1017,22 @@ bool isStarred(const char* id) {
 
 // The speaker is playing something the Tab5 resolved from YouTube.
 bool youtubeNow() { return !strcmp(view.source, "YouTube") && tube.playingId[0]; }
+
+bool youtubeWaiting() {
+    if (tube.busy) return true;
+    return !strcmp(tube.phase, "Opening YouTube") || !strcmp(tube.phase, "Starting the speaker");
+}
+
+// The home screen shows the YouTube card instead of whatever Sonos last reported.
+bool youtubePending() {
+    if (!tube.playingId[0]) return false;
+    if (youtubeWaiting() || tube.phase[0]) return true;
+    return tube.held && !view.title[0];
+}
+
+bool youtubeRunning() {
+    return !youtubePending() && view.playing && youtubeNow();
+}
 
 bool ytGrid = false;
 
@@ -1026,7 +1299,9 @@ StarThumb* thumbFor(const char* id) {
 }
 
 bool tubeThumbWanted(const char* id) {
-    if (!id || !id[0] || panel != Panel::Browse || !youtube) return false;
+    if (!id || !id[0]) return false;
+    if (tube.playingId[0] && !strcmp(id, tube.playingId) && (tube.held || tube.busy || tube.phase[0])) return true;
+    if (panel != Panel::Browse || !youtube) return false;
     if (ytStars) {
         for (int i = 0; i < tube.starCount; i++)
             if (!strcmp(tube.stars[i].id, id)) return true;
@@ -1039,8 +1314,9 @@ bool tubeThumbWanted(const char* id) {
 
 // Decodes a few thumbnails per frame for the YouTube list that is on screen.
 void updateStarThumbs() {
-    int wantW = tubeGrid() ? gridCardW() : THUMB_W;
-    int wantH = tubeGrid() ? gridCardH() : THUMB_H;
+    bool browseTube = panel == Panel::Browse && youtube;
+    int wantW = (browseTube && tubeGrid()) ? gridCardW() : THUMB_W;
+    int wantH = (browseTube && tubeGrid()) ? gridCardH() : THUMB_H;
     for (StarThumb& t : starThumbs) {
         if (!t.used) continue;
         bool sizeOk = !t.sprite || (t.sprite->width() == wantW && t.sprite->height() == wantH);
@@ -1051,11 +1327,16 @@ void updateStarThumbs() {
         }
         t = StarThumb{};
     }
-    if (!jpg || panel != Panel::Browse || !youtube) return;
+    bool homeThumb = tube.playingId[0] && (tube.held || tube.busy || tube.phase[0]);
+    if (!jpg || ((panel != Panel::Browse || !youtube) && !homeThumb)) return;
     int made = 0;
     int nItems = ytStars ? tube.starCount : tube.count;
+    if (homeThumb && !browseTube) {
+        nItems = 1;
+    }
     for (int i = 0; i < nItems; i++) {
-        const char* id = ytStars ? tube.stars[i].id : tube.items[i].id;
+        const char* id = (!browseTube && homeThumb) ? tube.playingId : (ytStars ? tube.stars[i].id : tube.items[i].id);
+        if (!tubeThumbWanted(id)) continue;
         StarThumb* have = thumbFor(id);
         if (have && have->sprite) continue;
         StarThumb* slot = have;
@@ -1487,12 +1768,15 @@ int actY() { return 456; }
 const int SLEEP_MINS[] = {0, 1, 5, 15, 30};
 const char* SLEEP_LABELS[] = {"Off", "1 min", "5 min", "15 min", "30 min"};
 constexpr int SLEEP_N = 5;
-constexpr int SLEEP_Y = 286;
-constexpr int SLEEP_H = 88;
-constexpr int CLICK_Y = 460;
-constexpr int CLICK_H = 80;
+constexpr int SLEEP_Y = 260;
+constexpr int SLEEP_H = 72;
+constexpr int CLICK_Y = 376;
+constexpr int CLICK_H = 68;
 constexpr int CLICK_W = 400;
 constexpr int SLEEP_W = 232;
+constexpr int COVER_Y = 488;
+constexpr int COVER_H = 68;
+constexpr int COVER_W = (FIELD_W - 16) / 2;
 
 int sleepX(int i) { return FIELD_X + i * (SLEEP_W + 16); }
 
@@ -1584,9 +1868,10 @@ void drawSettings(M5Canvas& c) {
 
     if (settingsTab == 1) {
         c.setFont(&fontBody);
-        text(c, "The backlight turns off after the screen is left alone. Music keeps playing.", FIELD_X, 200,
+        text(c, "Left alone, the screen turns off. Music keeps playing, and the next tap only wakes it.",
+             FIELD_X, 188, FIELD_W, COL_MUTED);
+        text(c, "On battery it always turns off. Plugged in, it can show the picture instead.", FIELD_X, 220,
              FIELD_W, COL_MUTED);
-        text(c, "The next tap only wakes it.", FIELD_X, 240, FIELD_W, COL_MUTED);
         for (int i = 0; i < SLEEP_N; i++) {
             int x = sleepX(i);
             bool on = sleepMin == SLEEP_MINS[i];
@@ -1613,6 +1898,21 @@ void drawSettings(M5Canvas& c) {
             c.drawString(clickLabels[i], x + CLICK_W / 2, CLICK_Y + CLICK_H / 2);
             c.setTextDatum(TL_DATUM);
         }
+        c.setFont(&fontBody);
+        c.setTextColor(COL_MUTED);
+        c.drawString("When it is plugged in", FIELD_X, COVER_Y - 32);
+        const char* coverLabels[] = {"Turn off", "Show the picture"};
+        for (int i = 0; i < 2; i++) {
+            int x = FIELD_X + i * (COVER_W + 16);
+            bool on = showCover == (i == 1);
+            bool hot = pressedAt(x, COVER_Y, COVER_W, COVER_H);
+            c.fillRoundRect(x, COVER_Y, COVER_W, COVER_H, 16, (on || hot) ? COL_ACCENT : COL_CARD);
+            c.setFont(&fontUi);
+            c.setTextColor((on || hot) ? COL_BG : COL_TEXT);
+            c.setTextDatum(MC_DATUM);
+            c.drawString(coverLabels[i], x + COVER_W / 2, COVER_Y + COVER_H / 2);
+            c.setTextDatum(TL_DATUM);
+        }
         return;
     }
 
@@ -1620,7 +1920,7 @@ void drawSettings(M5Canvas& c) {
     char bat[64], up[32], mem[48], sig[32], rooms[24], screen[40];
     if (power.known && power.pct >= 0) {
         snprintf(bat, sizeof(bat), "%d%%   %d mV   %d mA%s", power.pct, power.mv, power.ma,
-                 power.charging ? "   charging" : "");
+                 power.charging ? "   charging" : (power.onExternal ? "   plugged in" : ""));
     } else if (power.known) {
         snprintf(bat, sizeof(bat), "%s   %d mV", pack, power.mv);
     } else {
@@ -1657,10 +1957,10 @@ void drawMain(M5Canvas& c) {
                        : (view.groupName[0] ? view.groupName : "No room");
     drawHomeHeader(c, room, !view.household);
     drawBattery(c, BATT_X, BATT_Y);
-    drawHeaderButton(c, BROWSE, 0, panel == Panel::Browse);
-    drawHeaderButton(c, QUEUE, 1, panel == Panel::Queue);
-    drawHeaderButton(c, FAV, 2, panel == Panel::Favs);
-    drawHeaderButton(c, SET, 3, panel == Panel::Settings);
+    drawHeaderButton(c, placeHeader(BROWSE), 0, panel == Panel::Browse);
+    drawHeaderButton(c, placeHeader(QUEUE), 1, panel == Panel::Queue);
+    drawHeaderButton(c, placeHeader(FAV), 2, panel == Panel::Favs);
+    drawHeaderButton(c, placeHeader(SET), 3, panel == Panel::Settings);
 
     c.drawFastHLine(0, 108, c.width(), COL_LINE);
     int roomsH = LIST_B - LIST_Y;
@@ -1709,15 +2009,40 @@ void drawMain(M5Canvas& c) {
                 const sonos::RoomView& r = view.rooms[i + k];
                 int rowY = LIST_Y + roomTop[i + k] - roomScroll;
                 int rh = roomH[i + k];
-                if (group) c.fillCircle(LIST_X + 18, rowY + rh / 2, r.leader ? 6 : 4, COL_ACCENT);
+                if (group) c.fillCircle(LIST_X + 18, showRoomVols ? rowY + 28 : rowY + rh / 2, r.leader ? 6 : 4, COL_ACCENT);
                 c.setFont(&fontUi);
                 int textX = LIST_X + (group ? 36 : 18);
                 int nameRight = LIST_X + LIST_W - (playing ? 108 : 68);
                 int nameW = nameRight - textX;
                 if (nameW < 40) nameW = 40;
-                int textY = rowY + (rh - c.fontHeight()) / 2;
+                int textY = group && showRoomVols ? rowY + 12 : rowY + (rh - c.fontHeight()) / 2;
                 text(c, r.name[0] ? r.name : "Room", textX, textY, nameW,
                      r.coordinator ? COL_ACCENT : COL_TEXT);
+                if (group && showRoomVols) {
+                    int sx, sy, sw, sh;
+                    if (roomSliderGeom(i + k, &sx, &sy, &sw, &sh)) {
+                        bool known = false;
+                        int vol = shownRoomVol(i + k, &known);
+                        int barW = sw - 44;
+                        int barY = sy + (sh - 8) / 2;
+                        c.fillRoundRect(sx, barY, barW, 8, 4, COL_LINE);
+                        if (known) {
+                            int fill = barW * vol / 100;
+                            if (fill > 0) c.fillRoundRect(sx, barY, fill, 8, 4, COL_ACCENT);
+                            int knob = sx + fill;
+                            if (knob < sx + 7) knob = sx + 7;
+                            if (knob > sx + barW - 7) knob = sx + barW - 7;
+                            c.fillCircle(knob, barY + 4, 7, COL_TEXT);
+                            char num[8];
+                            snprintf(num, sizeof(num), "%d", vol);
+                            c.setFont(&fontBody);
+                            c.setTextColor(COL_MUTED);
+                            c.setTextDatum(ML_DATUM);
+                            c.drawString(num, sx + barW + 8, barY + 4);
+                            c.setTextDatum(TL_DATUM);
+                        }
+                    }
+                }
             }
             if (selected || pressedAt(LIST_X, y, LIST_W - 8, cardH))
                 c.drawRoundRect(LIST_X, y, LIST_W - 8, cardH, 14, COL_ACCENT);
@@ -1755,9 +2080,17 @@ void drawMain(M5Canvas& c) {
     }
 
     if (panel == Panel::Closed) {
+        bool pending = youtubePending();
         c.fillRoundRect(ART_X, ART_Y, ART, ART, 16, COL_CARD);
-        if (hasArt && art.getBuffer()) art.pushSprite(&c, ART_X, ART_Y);
-        else {
+        StarThumb* heldThumb = pending ? thumbFor(tube.playingId) : nullptr;
+        if (pending && heldThumb && heldThumb->sprite) {
+            M5Canvas* sp = heldThumb->sprite;
+            c.setClipRect(ART_X, ART_Y, ART, ART);
+            sp->pushSprite(&c, ART_X + (ART - sp->width()) / 2, ART_Y + (ART - sp->height()) / 2);
+            c.clearClipRect();
+        } else if (!pending && hasArt && art.getBuffer()) {
+            art.pushSprite(&c, ART_X, ART_Y);
+        } else {
             c.setFont(&fontBody);
             c.setTextColor(COL_MUTED);
             c.setTextDatum(MC_DATUM);
@@ -1767,8 +2100,9 @@ void drawMain(M5Canvas& c) {
 
         int tx = ART_X + ART + 28;
         int tw = c.width() - tx - 24;
-        bool haveTrack = view.title[0] != 0;
-        if (haveTrack && youtubeNow()) {
+        bool haveTrack = pending || view.title[0] != 0;
+        bool showStar = pending || (haveTrack && youtubeNow());
+        if (showStar) {
             tw -= 62;
             bool hot = pressedAt(STAR_NOW.x, STAR_NOW.y, STAR_NOW.w, STAR_NOW.h);
             bool on = isStarred(tube.playingId);
@@ -1777,38 +2111,48 @@ void drawMain(M5Canvas& c) {
         }
         int y = ART_Y;
         c.setClipRect(tx, ART_Y, tw + 8, PLAY.y - 8 - ART_Y);
-        if (haveTrack && view.source[0]) {
-            drawSource(c, tx, y, view.source);
+        const char* source = pending ? "YouTube" : view.source;
+        if (haveTrack && source[0]) {
+            drawSource(c, tx, y, source);
             y += 50;
         }
+        const char* titleText = pending ? (tube.playingTitle[0] ? tube.playingTitle : "YouTube")
+                                        : (haveTrack ? view.title : "Nothing playing");
         c.setFont(&fontTitle);
-        y += drawWrapped(c, haveTrack ? view.title : "Nothing playing", tx, y, tw, 2, COL_TEXT);
+        y += drawWrapped(c, titleText, tx, y, tw, 2, COL_TEXT);
         y += 10;
         c.setFont(&fontBody);
-        if (view.artist[0]) {
-            y += drawWrapped(c, view.artist, tx, y, tw, 1, COL_TEXT);
+        const char* artist = pending ? tube.playingChannel : view.artist;
+        if (artist[0]) {
+            y += drawWrapped(c, artist, tx, y, tw, 1, COL_TEXT);
             y += 6;
         }
-        if (view.album[0]) {
+        if (!pending && view.album[0]) {
             y += drawWrapped(c, view.album, tx, y, tw, 1, COL_MUTED);
             y += 6;
         }
-        if (view.status[0]) {
-            y += drawWrapped(c, view.status, tx, y, tw, 1, COL_WARN);
+        const char* status = pending && tube.phase[0] ? tube.phase : (!pending ? view.status : "");
+        if (status[0]) {
+            y += drawWrapped(c, status, tx, y, tw, 1, COL_WARN);
             y += 6;
         }
 
         if (haveTrack) {
             char left[16], right[16], line[40];
-            shortClock(view.rel, left, sizeof(left));
-            shortClock(view.dur, right, sizeof(right));
+            bool ytClock = pending || youtubeNow();
+            if (pending) strlcpy(left, "0:00", sizeof(left));
+            else shortClock(view.rel, left, sizeof(left));
+            int sonosDur = clockSeconds(view.dur);
+            int known = ytClock && tube.playingSeconds > 0 ? tube.playingSeconds : 0;
+            if (ytClock && sonosDur <= 0 && known > 0) formatSeconds(known, right, sizeof(right));
+            else shortClock(pending ? "" : view.dur, right, sizeof(right));
             snprintf(line, sizeof(line), "%s   /   %s", left, right);
             if (y > PLAY.y - 90) y = PLAY.y - 90;
             y += 8;
             text(c, line, tx, y, tw, COL_MUTED);
             y += c.fontHeight() + 10;
-            int total = clockSeconds(view.dur);
-            int pos = clockSeconds(view.rel);
+            int total = pending ? known : (sonosDur > 0 ? sonosDur : known);
+            int pos = pending ? 0 : clockSeconds(view.rel);
             int bw = tw > 40 ? tw : 40;
             c.fillRoundRect(tx, y, bw, 10, 5, COL_CARD2);
             if (total > 0) {
@@ -1827,8 +2171,11 @@ void drawMain(M5Canvas& c) {
             uint16_t fg = accent && !hot ? COL_BG : COL_TEXT;
             drawTransportIcon(c, b, kind, fg);
         };
+        char playKind = 'p';
+        if (youtubeRunning()) playKind = 'q';
+        else if (!pending && view.playing) playKind = 's';
         transport(PREV, '<', false);
-        transport(PLAY, view.playing ? 's' : 'p', true);
+        transport(PLAY, playKind, true);
         transport(NEXT, '>', false);
     } else {
         c.setFont(&fontUi);
@@ -2005,7 +2352,7 @@ void onSettingsTap(int x, int y) {
             int cx = sleepX(i);
             if (x >= cx && x < cx + SLEEP_W) {
                 storeSleep(SLEEP_MINS[i]);
-                if (SLEEP_MINS[i] == 0 && asleep) wakeScreen();
+                if (SLEEP_MINS[i] == 0 && (asleep || coverMode)) wakeScreen();
                 return;
             }
         }
@@ -2019,6 +2366,15 @@ void onSettingsTap(int x, int y) {
             }
         }
     }
+    if (settingsTab == 1 && y >= COVER_Y && y < COVER_Y + COVER_H) {
+        for (int i = 0; i < 2; i++) {
+            int cx = FIELD_X + i * (COVER_W + 16);
+            if (x >= cx && x < cx + COVER_W) {
+                storeCover(i == 1);
+                return;
+            }
+        }
+    }
 }
 
 void onTap(int x, int y) {
@@ -2028,7 +2384,11 @@ void onTap(int x, int y) {
         wifiField = 0;
         return;
     }
-    if (SET.contains(x, y)) {
+    Box setBtn = placeHeader(SET);
+    Box browseBtn = placeHeader(BROWSE);
+    Box queueBtn = placeHeader(QUEUE);
+    Box favBtn = placeHeader(FAV);
+    if (setBtn.contains(x, y)) {
         if (panel == Panel::Settings) {
             panel = Panel::Closed;
             keyboard = false;
@@ -2045,10 +2405,10 @@ void onTap(int x, int y) {
         if (panel == Panel::Settings) onSettingsTap(x, y);
         return;
     }
-    if (BROWSE.contains(x, y) || QUEUE.contains(x, y) || FAV.contains(x, y)) {
+    if (browseBtn.contains(x, y) || queueBtn.contains(x, y) || favBtn.contains(x, y)) {
         Panel next = Panel::Favs;
-        if (BROWSE.contains(x, y)) next = Panel::Browse;
-        else if (QUEUE.contains(x, y)) next = Panel::Queue;
+        if (browseBtn.contains(x, y)) next = Panel::Browse;
+        else if (queueBtn.contains(x, y)) next = Panel::Queue;
         if (panel == next) panel = Panel::Closed;
         else {
             panel = next;
@@ -2062,7 +2422,7 @@ void onTap(int x, int y) {
         }
         return;
     }
-    if (panel == Panel::Closed && view.title[0] && youtubeNow() && STAR_NOW.contains(x, y)) {
+    if (panel == Panel::Closed && tube.playingId[0] && (youtubePending() || youtubeNow()) && STAR_NOW.contains(x, y)) {
         yt::toggleStar(tube.playingId, tube.playingTitle, tube.playingChannel);
         return;
     }
@@ -2070,11 +2430,22 @@ void onTap(int x, int y) {
         sonos::command(sonos::Cmd::Mute, view.muted ? 0 : 1, nullptr);
         return;
     }
+    if (panel == Panel::Closed && youtubeWaiting() &&
+        (PREV.contains(x, y) || PLAY.contains(x, y) || NEXT.contains(x, y))) {
+        return;
+    }
+    if (panel == Panel::Closed && tube.phase[0] && (PREV.contains(x, y) || NEXT.contains(x, y))) return;
     if (panel == Panel::Closed && PREV.contains(x, y)) {
         sonos::command(sonos::Cmd::Prev, 0, nullptr);
         return;
     }
     if (panel == Panel::Closed && PLAY.contains(x, y)) {
+        bool restart = tube.held && tube.playingId[0] && !youtubeRunning();
+        if (restart) {
+            yt::requestResolve(tube.playingId);
+            return;
+        }
+        if (youtubeRunning()) yt::stopWatch();
         sonos::command(view.playing ? sonos::Cmd::Pause : sonos::Cmd::Play, 0, nullptr);
         return;
     }
@@ -2087,7 +2458,13 @@ void onTap(int x, int y) {
         return;
     }
     if (panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
-        int idx = -1;
+        int idx = roomIndexAt(y);
+        int sx, sy, sw, sh;
+        if (idx >= 0 && roomSliderGeom(idx, &sx, &sy, &sw, &sh) && x >= sx && x < sx + sw && y >= sy && y < sy + sh) {
+            sendRoomVol(idx, roomVolFromX(idx, x), true);
+            return;
+        }
+        idx = -1;
         if (roomActionAt(x, y, &idx)) {
             sonos::command(roomAction(idx) == RoomAction::Add ? sonos::Cmd::JoinRoom : sonos::Cmd::LeaveRoom,
                            0, view.rooms[idx].uuid);
@@ -2306,10 +2683,22 @@ void beginGesture(int x, int y) {
     lastY = y;
     lastActivity = millis();
     if (net::connected() && panel != Panel::Browse && VOL.contains(x, y)) {
+        volAnchor = displayVolume();
         drag = Drag::Volume;
+        volGesture++;
         int vol = (x - VOL.x) * 100 / VOL.w;
         sendVolume(vol, true);
         return;
+    }
+    if (net::connected() && panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y &&
+        y < LIST_B) {
+        int idx = roomIndexAt(y);
+        int sx, sy, sw, sh;
+        if (idx >= 0 && roomSliderGeom(idx, &sx, &sy, &sw, &sh) && x >= sx && y >= sy && x < sx + sw && y < sy + sh) {
+            drag = Drag::RoomVol;
+            sendRoomVol(idx, roomVolFromX(idx, x), true);
+            return;
+        }
     }
     if (!net::connected() || panel == Panel::Settings) {
         drag = Drag::None;
@@ -2347,6 +2736,10 @@ void moveGesture(int x, int y) {
     if (abs(x - x0) > 12 || abs(y - y0) > 12) moved = true;
     if (drag == Drag::Volume) {
         sendVolume((x - VOL.x) * 100 / VOL.w, false);
+        return;
+    }
+    if (drag == Drag::RoomVol) {
+        sendRoomVol(roomDrag, roomVolFromX(roomDrag, x), false);
         return;
     }
     if (!moved) return;
@@ -2419,6 +2812,7 @@ void sendShot() {
 void endGesture(int x, int y) {
     lastActivity = millis();
     if (drag == Drag::Volume) sendVolume(localVol, true);
+    else if (drag == Drag::RoomVol) sendRoomVol(roomDrag, roomLocal, true);
     else if (!moved) {
         flashUntil = millis() + 180;
         flashX = x;
@@ -2430,6 +2824,149 @@ void endGesture(int x, int y) {
     moved = false;
     drag = Drag::None;
     if (view.volume == localVol) freezeVol = false;
+}
+
+bool coverArtReady() {
+    bool picture = (hasArt && art.getBuffer()) || coverPic.getBuffer();
+    if (tube.playingId[0]) {
+        StarThumb* th = thumbFor(tube.playingId);
+        if (th && th->sprite && th->sprite->getBuffer()) picture = true;
+    }
+    if (!picture) return false;
+    if (view.playing || view.title[0]) return true;
+    return tube.playingId[0] && (youtubePending() || tube.held);
+}
+
+bool imageSize(const uint8_t* p, size_t n, int* w, int* h) {
+    if (n >= 24 && p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G') {
+        *w = (p[16] << 24) | (p[17] << 16) | (p[18] << 8) | p[19];
+        *h = (p[20] << 24) | (p[21] << 16) | (p[22] << 8) | p[23];
+        return *w > 0 && *h > 0 && *w < 8000 && *h < 8000;
+    }
+    if (n < 4 || p[0] != 0xFF || p[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 9 < n) {
+        if (p[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        uint8_t m = p[i + 1];
+        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+            i += 2;
+            continue;
+        }
+        if (m == 0xD9) return false;
+        int len = (p[i + 2] << 8) | p[i + 3];
+        if (len < 2 || i + 2 + (size_t)len > n) return false;
+        if (m == 0xC0 || m == 0xC1 || m == 0xC2) {
+            *h = (p[i + 5] << 8) | p[i + 6];
+            *w = (p[i + 7] << 8) | p[i + 8];
+            return *w > 0 && *h > 0 && *w < 8000 && *h < 8000;
+        }
+        i += 2 + (size_t)len;
+    }
+    return false;
+}
+
+void blitSmooth(M5Canvas& c, M5Canvas* sp) {
+    int sw = sp->width();
+    int sh = sp->height();
+    if (sw < 1 || sh < 1) return;
+    int maxW = c.width() - 80;
+    int maxH = c.height() - 150;
+    float zoom = (float)maxW / sw;
+    float zy = (float)maxH / sh;
+    if (zy < zoom) zoom = zy;
+    sp->setPivot(sw / 2.0f, sh / 2.0f);
+    sp->pushRotateZoomWithAA(&c, c.width() / 2.0f, (c.height() - 110) / 2.0f, 0.0f, zoom, zoom);
+}
+
+// Decode the original picture once, at the size the cover shows, instead of enlarging the 180px sprite.
+void prepareCoverPic() {
+    if (!jpg || view.artGen == coverGen) return;
+    int gen = 0;
+    size_t n = sonos::copyArt(jpg, JPG_CAP, &gen);
+    coverGen = gen;
+    if (coverPic.getBuffer()) coverPic.deleteSprite();
+    if (n < 32) return;
+    int iw = 0, ih = 0;
+    if (!imageSize(jpg, n, &iw, &ih)) return;
+    int maxW = 1200;
+    int maxH = 570;
+    float fit = (float)maxW / iw;
+    float fy = (float)maxH / ih;
+    if (fy < fit) fit = fy;
+    int dw = (int)(iw * fit + 0.5f);
+    int dh = (int)(ih * fit + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    bool jpeg = jpg[0] == 0xFF && jpg[1] == 0xD8;
+    bool png = jpg[0] == 0x89 && jpg[1] == 'P';
+    auto top = lgfx::v1::textdatum::top_left;
+    M5Canvas native;
+    native.setColorDepth(16);
+    native.setPsram(true);
+    native.createSprite(iw, ih);
+    bool decoded = false;
+    if (native.getBuffer()) {
+        if (jpeg) decoded = native.drawJpg(jpg, n, 0, 0, iw, ih, 0, 0, 1.0f, 1.0f, top);
+        else if (png) decoded = native.drawPng(jpg, n, 0, 0, iw, ih, 0, 0, 1.0f, 1.0f, top);
+    }
+    if (!decoded) {
+        native.deleteSprite();
+        return;
+    }
+    coverPic.setColorDepth(16);
+    coverPic.setPsram(true);
+    coverPic.createSprite(dw, dh);
+    if (!coverPic.getBuffer()) {
+        native.deleteSprite();
+        return;
+    }
+    coverPic.fillSprite(TFT_BLACK);
+    native.setPivot(iw / 2.0f, ih / 2.0f);
+    native.pushRotateZoomWithAA(&coverPic, dw / 2.0f, dh / 2.0f, 0.0f, fit, fit);
+    native.deleteSprite();
+    Serial.printf("[ui] cover picture %dx%d from %dx%d\n", dw, dh, iw, ih);
+}
+
+void drawCover(M5Canvas& c) {
+    c.fillSprite(TFT_BLACK);
+    c.setTextDatum(TL_DATUM);
+    prepareCoverPic();
+    if (coverPic.getBuffer()) {
+        int x = (c.width() - coverPic.width()) / 2;
+        int y = ((c.height() - 110) - coverPic.height()) / 2;
+        if (y < 16) y = 16;
+        coverPic.pushSprite(&c, x, y);
+    } else {
+        M5Canvas* sp = nullptr;
+        if (hasArt && art.getBuffer()) sp = &art;
+        else if (tube.playingId[0]) {
+            StarThumb* th = thumbFor(tube.playingId);
+            if (th && th->sprite && th->sprite->getBuffer()) sp = th->sprite;
+        }
+        if (sp) blitSmooth(c, sp);
+    }
+
+    const char* title = view.title;
+    const char* artist = view.artist;
+    if (tube.playingTitle[0] && (youtubePending() || (tube.held && !view.title[0]))) {
+        title = tube.playingTitle;
+        artist = tube.playingChannel;
+    }
+    c.setTextDatum(MC_DATUM);
+    c.setFont(&fontTitle);
+    c.setTextColor(COL_TEXT);
+    c.setClipRect(40, c.height() - 120, c.width() - 80, 52);
+    c.drawString(title[0] ? title : " ", c.width() / 2, c.height() - 96);
+    c.clearClipRect();
+    c.setFont(&fontBody);
+    c.setTextColor(COL_MUTED);
+    c.setClipRect(40, c.height() - 68, c.width() - 80, 44);
+    if (artist[0]) c.drawString(artist, c.width() / 2, c.height() - 48);
+    c.clearClipRect();
+    c.setTextDatum(TL_DATUM);
 }
 
 }  // namespace
@@ -2484,6 +3021,8 @@ void loop() {
         return;
     }
 
+    if (showRoomVols && drag != Drag::Volume && drag != Drag::RoomVol && millis() > roomVolsUntil)
+        showRoomVols = false;
     sonos::copyView(view);
     svc::copyView(browse);
     yt::copyView(tube);
@@ -2510,7 +3049,7 @@ void loop() {
     serviceSleep();
 
     auto t = M5.Touch.getDetail();
-    if (asleep) {
+    if (asleep || coverMode) {
         if (t.wasPressed()) {
             wakeScreen();
             swallowTouch = true;
@@ -2526,13 +3065,19 @@ void loop() {
     if (tapPending) {
         tapPending = false;
         lastActivity = millis();
-        if (asleep) wakeScreen();
+        if (asleep || coverMode) wakeScreen();
         else onTap(tapX, tapY);
     }
     if (net::connected()) maybeDecode();
     if (net::connected()) updateStarThumbs();
     if (net::connected()) updateSpotifyThumbs();
-    if (net::connected()) drawMain(canvas);
+    if (!coverMode && coverPic.getBuffer()) {
+        coverPic.deleteSprite();
+        coverGen = -1;
+    }
+    layoutRooms();
+    if (coverMode) drawCover(canvas);
+    else if (net::connected()) drawMain(canvas);
     else if (panel == Panel::Settings) {
         canvas.fillSprite(COL_BG);
         canvas.setTextDatum(TL_DATUM);
@@ -2540,7 +3085,7 @@ void loop() {
         canvas.setTextColor(COL_TEXT);
         drawHomeHeader(canvas, "Not connected", true);
         drawBattery(canvas, BATT_X, BATT_Y);
-        drawHeaderButton(canvas, SET, 3, true);
+        drawHeaderButton(canvas, placeHeader(SET), 3, true);
         canvas.drawFastHLine(0, 108, canvas.width(), COL_LINE);
         drawSettings(canvas);
         if (keyboard) drawKeyboard(canvas);

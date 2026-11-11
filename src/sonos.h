@@ -11,7 +11,7 @@ constexpr int MAX_FAVS = 40;
 
 enum class Cmd : uint8_t {
     Play, Pause, Next, Prev, Volume, Mute, ToggleRoom, LoadFavorites, LoadQueue, PlayFavorite,
-    JoinRoom, LeaveRoom
+    JoinRoom, LeaveRoom, RoomVolume
 };
 
 struct RoomView {
@@ -22,6 +22,7 @@ struct RoomView {
     bool leader;       // this room is the zone coordinator
     bool coordinator;  // the room this controller is showing
     bool playing;
+    int volume;  // this room's own level, or -1 until it has been read
 };
 
 struct View {
@@ -52,7 +53,8 @@ struct View {
 
 void begin();
 void loop();
-void command(Cmd cmd, int value, const char* text);
+// extra is the main slider's level when a volume gesture starts, otherwise -1.
+void command(Cmd cmd, int value, const char* text, int extra = -1);
 // Network task only. Adds a service item to the selected room's queue.
 // playNow jumps to it and starts it. Returns false when the speaker rejects the item.
 bool enqueue(const char* uri, const char* meta, bool playNow);
