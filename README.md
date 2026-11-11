@@ -1,10 +1,14 @@
 # M5Tab Sonos Controller
 
-A wall controller for the [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5) that plays **YouTube on your Sonos speakers**. Search on the tablet, tap a video, and the room plays the audio. No phone, no PC and no extra box in the middle. It is also a full Sonos remote: rooms and grouping, transport, volume, the queue, favorites and Spotify.
+A desk controller for the [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5) that plays **YouTube on your Sonos speakers**. Search on the tablet, tap a video, and the room plays the audio. No phone, no PC and no extra box in the middle. It is also a full Sonos remote: rooms and grouping, transport, volume, the queue, favorites and Spotify.
 
 ![Tab5](https://img.shields.io/badge/board-M5Stack%20Tab5-blue) ![ESP32-P4](https://img.shields.io/badge/chip-ESP32--P4-orange) ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
 > **Status:** a hobby project that works well on the author's unit. It has been tested on one Tab5 and one Sonos system. Expect rough edges, and please open an issue if you find one.
+
+I built this because I wanted an independent way to control the music in my home, without a phone or a television in the middle. Something that is always ready, and dedicated to this.
+
+I like listening to YouTube music sets, and I could not find anything that did the job. This build is where those frustrations got solved. I hope other people find it useful.
 
 <p align="center">
   <img src="docs/images/now-playing-youtube.png" alt="YouTube playing in a Sonos room, with grouping on the room list" width="720">
@@ -25,6 +29,11 @@ A wall controller for the [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5) 
 - A **2.4 GHz Wi-Fi** network. The Tab5's radio does not use 5 GHz.
 - A computer with a USB-C cable, once, to flash it.
 - Optional, for Spotify: a Spotify account that is already linked in the Sonos app, and a free Spotify developer app (see below).
+
+This is best on a desk. Wall mounting is not recommended. Two free prints hold the Tab5:
+
+- [M5Stack Tab5 stand, with the battery and a breakout board](https://makerworld.com/nl/models/3565358-m5stack-tab5-stand-battery-breakout-board). A compact stand in two versions. The plain one is only the stand. The other leaves room for a breakout board and needs two M3 heat-set inserts. Both take the NP-F550 pack, and both work with the pack left out.
+- [M5Stack Tab5 desk stand](https://makerworld.com/nl/models/3175466-m5stack-tab5-desk-stand). A smaller stand, in three versions. The feet have holes for 10 mm silicone pads so it does not slide.
 
 ## Install
 
@@ -66,7 +75,7 @@ You can also set the network over USB serial with `W ssid|password`. See [Serial
 - **Top left:** a speaker and the name of the room you are controlling. Tap it to leave Browse, Queue, Favorites or Settings and return to the home screen.
 - **Top right:** icons for **Browse** (magnifier), **Queue**, **Favorites** (heart) and **Settings** (gear), then the battery when a pack is installed. On USB with no pack those icons shift into the battery's place. A charging pack shows a lightning mark in the battery. The battery is an icon only. The address of the Tab5 is on the Device tab in Settings.
 - **Settings.** Three tabs. **Wi-Fi** joins, forgets or reconnects a network. **Screen** sets how long the backlight stays on, whether a tap clicks (off, a low tone, or a higher one), and what happens once that time is up. On battery the screen turns off. Plugged in, it can show the picture of the YouTube or Spotify track that is playing. **Device** shows the battery, memory, signal and uptime. The next tap wakes the screen without pressing whatever is underneath. A button lights up while it is pressed, and the speaker makes a short click.
-- **Rotation.** The screen starts upside down from the panel's native landscape, which is how this tablet is mounted. Turn it over and it follows. The layout stays landscape.
+- **Rotation.** The screen starts in the landscape pose it rests in on a desk. Turn it over and it follows. The layout stays landscape.
 
 ### YouTube
 
