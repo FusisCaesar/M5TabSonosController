@@ -83,9 +83,18 @@ int favScroll = 0;
 bool pressing = false;
 bool moved = false;
 int x0 = 0, y0 = 0, lastY = 0, scroll0 = 0;
-enum class Drag : uint8_t { None, Rooms, Favs, Volume };
+enum class Drag : uint8_t { None, Rooms, Favs, Volume, RoomVol };
 Drag drag = Drag::None;
 int localVol = 0;
+int roomDrag = -1;
+int roomLocal = 0;
+char roomHoldId[40] = "";
+uint32_t roomHoldUntil = 0;
+uint32_t lastRoomSend = 0;
+int volAnchor = 0;
+int volGesture = 0;
+bool showRoomVols = false;
+uint32_t roomVolsUntil = 0;
 bool freezeVol = false;
 uint32_t volFreezeUntil = 0;
 uint32_t lastVolSend = 0;
@@ -501,6 +510,7 @@ int listMax(int count, int viewH, int row) {
 constexpr int ROOM_GAP = 10;
 constexpr int ROOM_SOLO = ROW_H - ROOM_GAP;
 constexpr int ROOM_MEMBER = 64;
+constexpr int ROOM_MEMBER_VOL = 104;
 int roomTop[sonos::MAX_ROOMS];
 int roomH[sonos::MAX_ROOMS];
 int roomsContent = 0;
@@ -519,7 +529,7 @@ void layoutRooms() {
     int i = 0;
     while (i < view.roomCount && i < sonos::MAX_ROOMS) {
         int n = groupRun(i);
-        int slice = n == 1 ? ROOM_SOLO : ROOM_MEMBER;
+        int slice = n == 1 ? ROOM_SOLO : (showRoomVols ? ROOM_MEMBER_VOL : ROOM_MEMBER);
         for (int k = 0; k < n; k++) {
             roomTop[i + k] = roomsContent + k * slice;
             roomH[i + k] = slice;
@@ -559,7 +569,31 @@ void roomActionBox(int i, int* x, int* y, int* w, int* h) {
     *w = 44;
     *h = 44;
     *x = LIST_X + LIST_W - 60;
-    *y = rowY + (roomH[i] - *h) / 2;
+    *y = view.rooms[i].inGroup && showRoomVols ? rowY + 8 : rowY + (roomH[i] - *h) / 2;
+}
+
+bool groupPlaying(int i) {
+    if (i < 0 || i >= view.roomCount) return false;
+    int start = i;
+    while (start > 0 && view.rooms[start].inGroup && view.rooms[start - 1].inGroup &&
+           !strcmp(view.rooms[start].group, view.rooms[start - 1].group))
+        start--;
+    int n = groupRun(start);
+    for (int k = 0; k < n; k++)
+        if (view.rooms[start + k].playing) return true;
+    return false;
+}
+
+// The thin slider under a grouped room's name. Solo rooms use the main slider.
+bool roomSliderGeom(int i, int* x, int* y, int* w, int* h) {
+    if (!showRoomVols || i < 0 || i >= view.roomCount || !view.rooms[i].inGroup) return false;
+    int rowY = LIST_Y + roomTop[i] - roomScroll;
+    *x = LIST_X + 36;
+    *h = 32;
+    *y = rowY + roomH[i] - 40;
+    int right = LIST_X + LIST_W - (groupPlaying(i) ? 116 : 72);
+    *w = right - *x;
+    return *w >= 48;
 }
 
 bool roomActionAt(int x, int y, int* idx) {
@@ -737,15 +771,64 @@ int displayVolume() {
     return view.volume;
 }
 
+void revealRoomVols() {
+    showRoomVols = true;
+    roomVolsUntil = millis() + 8000;
+}
+
 void sendVolume(int vol, bool force) {
     if (vol < 0) vol = 0;
     if (vol > 100) vol = 100;
     localVol = vol;
     freezeVol = true;
     volFreezeUntil = millis() + 2500;
+    roomHoldId[0] = 0;
+    revealRoomVols();
     if (!force && millis() - lastVolSend < 120) return;
     lastVolSend = millis();
-    sonos::command(sonos::Cmd::Volume, vol, nullptr);
+    char gesture[12];
+    snprintf(gesture, sizeof(gesture), "%d", volGesture);
+    sonos::command(sonos::Cmd::Volume, vol, gesture, volAnchor);
+}
+
+int shownRoomVol(int i, bool* known) {
+    if (roomHoldId[0] && !strcmp(view.rooms[i].uuid, roomHoldId) && millis() < roomHoldUntil) {
+        if (known) *known = true;
+        return roomLocal;
+    }
+    int v = view.rooms[i].volume;
+    if (known) *known = v >= 0;
+    return v < 0 ? 0 : v;
+}
+
+void sendRoomVol(int i, int vol, bool force) {
+    if (i < 0 || i >= view.roomCount) return;
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    roomDrag = i;
+    roomLocal = vol;
+    strlcpy(roomHoldId, view.rooms[i].uuid, sizeof(roomHoldId));
+    roomHoldUntil = millis() + 2500;
+    if (view.rooms[i].coordinator) {
+        localVol = vol;
+        freezeVol = true;
+        volFreezeUntil = millis() + 2500;
+    }
+    revealRoomVols();
+    if (!force && millis() - lastRoomSend < 120) return;
+    lastRoomSend = millis();
+    sonos::command(sonos::Cmd::RoomVolume, vol, view.rooms[i].uuid);
+}
+
+int roomVolFromX(int i, int x) {
+    int sx, sy, sw, sh;
+    if (!roomSliderGeom(i, &sx, &sy, &sw, &sh)) return 0;
+    int bar = sw - 44;
+    if (bar < 1) bar = 1;
+    int vol = (x - sx) * 100 / bar;
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    return vol;
 }
 
 void drawTransportIcon(M5Canvas& c, const Box& b, char kind, uint16_t col) {
@@ -1881,15 +1964,40 @@ void drawMain(M5Canvas& c) {
                 const sonos::RoomView& r = view.rooms[i + k];
                 int rowY = LIST_Y + roomTop[i + k] - roomScroll;
                 int rh = roomH[i + k];
-                if (group) c.fillCircle(LIST_X + 18, rowY + rh / 2, r.leader ? 6 : 4, COL_ACCENT);
+                if (group) c.fillCircle(LIST_X + 18, showRoomVols ? rowY + 28 : rowY + rh / 2, r.leader ? 6 : 4, COL_ACCENT);
                 c.setFont(&fontUi);
                 int textX = LIST_X + (group ? 36 : 18);
                 int nameRight = LIST_X + LIST_W - (playing ? 108 : 68);
                 int nameW = nameRight - textX;
                 if (nameW < 40) nameW = 40;
-                int textY = rowY + (rh - c.fontHeight()) / 2;
+                int textY = group && showRoomVols ? rowY + 12 : rowY + (rh - c.fontHeight()) / 2;
                 text(c, r.name[0] ? r.name : "Room", textX, textY, nameW,
                      r.coordinator ? COL_ACCENT : COL_TEXT);
+                if (group && showRoomVols) {
+                    int sx, sy, sw, sh;
+                    if (roomSliderGeom(i + k, &sx, &sy, &sw, &sh)) {
+                        bool known = false;
+                        int vol = shownRoomVol(i + k, &known);
+                        int barW = sw - 44;
+                        int barY = sy + (sh - 8) / 2;
+                        c.fillRoundRect(sx, barY, barW, 8, 4, COL_LINE);
+                        if (known) {
+                            int fill = barW * vol / 100;
+                            if (fill > 0) c.fillRoundRect(sx, barY, fill, 8, 4, COL_ACCENT);
+                            int knob = sx + fill;
+                            if (knob < sx + 7) knob = sx + 7;
+                            if (knob > sx + barW - 7) knob = sx + barW - 7;
+                            c.fillCircle(knob, barY + 4, 7, COL_TEXT);
+                            char num[8];
+                            snprintf(num, sizeof(num), "%d", vol);
+                            c.setFont(&fontBody);
+                            c.setTextColor(COL_MUTED);
+                            c.setTextDatum(ML_DATUM);
+                            c.drawString(num, sx + barW + 8, barY + 4);
+                            c.setTextDatum(TL_DATUM);
+                        }
+                    }
+                }
             }
             if (selected || pressedAt(LIST_X, y, LIST_W - 8, cardH))
                 c.drawRoundRect(LIST_X, y, LIST_W - 8, cardH, 14, COL_ACCENT);
@@ -2301,7 +2409,13 @@ void onTap(int x, int y) {
         return;
     }
     if (panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y && y < LIST_B) {
-        int idx = -1;
+        int idx = roomIndexAt(y);
+        int sx, sy, sw, sh;
+        if (idx >= 0 && roomSliderGeom(idx, &sx, &sy, &sw, &sh) && x >= sx && x < sx + sw && y >= sy && y < sy + sh) {
+            sendRoomVol(idx, roomVolFromX(idx, x), true);
+            return;
+        }
+        idx = -1;
         if (roomActionAt(x, y, &idx)) {
             sonos::command(roomAction(idx) == RoomAction::Add ? sonos::Cmd::JoinRoom : sonos::Cmd::LeaveRoom,
                            0, view.rooms[idx].uuid);
@@ -2520,10 +2634,22 @@ void beginGesture(int x, int y) {
     lastY = y;
     lastActivity = millis();
     if (net::connected() && panel != Panel::Browse && VOL.contains(x, y)) {
+        volAnchor = displayVolume();
         drag = Drag::Volume;
+        volGesture++;
         int vol = (x - VOL.x) * 100 / VOL.w;
         sendVolume(vol, true);
         return;
+    }
+    if (net::connected() && panel != Panel::Browse && x >= LIST_X && x < LIST_X + LIST_W && y >= LIST_Y &&
+        y < LIST_B) {
+        int idx = roomIndexAt(y);
+        int sx, sy, sw, sh;
+        if (idx >= 0 && roomSliderGeom(idx, &sx, &sy, &sw, &sh) && x >= sx && y >= sy && x < sx + sw && y < sy + sh) {
+            drag = Drag::RoomVol;
+            sendRoomVol(idx, roomVolFromX(idx, x), true);
+            return;
+        }
     }
     if (!net::connected() || panel == Panel::Settings) {
         drag = Drag::None;
@@ -2561,6 +2687,10 @@ void moveGesture(int x, int y) {
     if (abs(x - x0) > 12 || abs(y - y0) > 12) moved = true;
     if (drag == Drag::Volume) {
         sendVolume((x - VOL.x) * 100 / VOL.w, false);
+        return;
+    }
+    if (drag == Drag::RoomVol) {
+        sendRoomVol(roomDrag, roomVolFromX(roomDrag, x), false);
         return;
     }
     if (!moved) return;
@@ -2633,6 +2763,7 @@ void sendShot() {
 void endGesture(int x, int y) {
     lastActivity = millis();
     if (drag == Drag::Volume) sendVolume(localVol, true);
+    else if (drag == Drag::RoomVol) sendRoomVol(roomDrag, roomLocal, true);
     else if (!moved) {
         flashUntil = millis() + 180;
         flashX = x;
@@ -2841,6 +2972,8 @@ void loop() {
         return;
     }
 
+    if (showRoomVols && drag != Drag::Volume && drag != Drag::RoomVol && millis() > roomVolsUntil)
+        showRoomVols = false;
     sonos::copyView(view);
     svc::copyView(browse);
     yt::copyView(tube);
@@ -2893,6 +3026,7 @@ void loop() {
         coverPic.deleteSprite();
         coverGen = -1;
     }
+    layoutRooms();
     if (coverMode) drawCover(canvas);
     else if (net::connected()) drawMain(canvas);
     else if (panel == Panel::Settings) {
