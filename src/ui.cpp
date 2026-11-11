@@ -604,6 +604,15 @@ void shortClock(const char* t, char* out, size_t n) {
     }
 }
 
+void formatSeconds(int seconds, char* out, size_t n) {
+    if (seconds < 0) seconds = 0;
+    int h = seconds / 3600;
+    int m = (seconds % 3600) / 60;
+    int s = seconds % 60;
+    if (h) snprintf(out, n, "%d:%02d:%02d", h, m, s);
+    else snprintf(out, n, "%d:%02d", m, s);
+}
+
 int displayVolume() {
     if (drag == Drag::Volume || (freezeVol && millis() < volFreezeUntil)) return localVol;
     if (view.volume < 0) return 0;
@@ -629,6 +638,8 @@ void drawTransportIcon(M5Canvas& c, const Box& b, char kind, uint16_t col) {
     } else if (kind == 's') {
         c.fillRoundRect(cx - 20, cy - 20, 12, 40, 3, col);
         c.fillRoundRect(cx + 8, cy - 20, 12, 40, 3, col);
+    } else if (kind == 'q') {
+        c.fillRoundRect(cx - 16, cy - 16, 32, 32, 4, col);
     } else if (kind == '<') {
         c.fillRoundRect(cx - 22, cy - 16, 8, 32, 2, col);
         c.fillTriangle(cx + 20, cy - 16, cx + 20, cy + 16, cx - 10, cy, col);
@@ -760,6 +771,22 @@ bool isStarred(const char* id) {
 
 // The speaker is playing something the Tab5 resolved from YouTube.
 bool youtubeNow() { return !strcmp(view.source, "YouTube") && tube.playingId[0]; }
+
+bool youtubeWaiting() {
+    if (tube.busy) return true;
+    return !strcmp(tube.phase, "Opening YouTube") || !strcmp(tube.phase, "Starting the speaker");
+}
+
+// The home screen shows the YouTube card instead of whatever Sonos last reported.
+bool youtubePending() {
+    if (!tube.playingId[0]) return false;
+    if (youtubeWaiting() || tube.phase[0]) return true;
+    return tube.held && !view.title[0];
+}
+
+bool youtubeRunning() {
+    return !youtubePending() && view.playing && youtubeNow();
+}
 
 bool ytGrid = false;
 
@@ -1026,7 +1053,9 @@ StarThumb* thumbFor(const char* id) {
 }
 
 bool tubeThumbWanted(const char* id) {
-    if (!id || !id[0] || panel != Panel::Browse || !youtube) return false;
+    if (!id || !id[0]) return false;
+    if (tube.playingId[0] && !strcmp(id, tube.playingId) && (tube.held || tube.busy || tube.phase[0])) return true;
+    if (panel != Panel::Browse || !youtube) return false;
     if (ytStars) {
         for (int i = 0; i < tube.starCount; i++)
             if (!strcmp(tube.stars[i].id, id)) return true;
@@ -1039,8 +1068,9 @@ bool tubeThumbWanted(const char* id) {
 
 // Decodes a few thumbnails per frame for the YouTube list that is on screen.
 void updateStarThumbs() {
-    int wantW = tubeGrid() ? gridCardW() : THUMB_W;
-    int wantH = tubeGrid() ? gridCardH() : THUMB_H;
+    bool browseTube = panel == Panel::Browse && youtube;
+    int wantW = (browseTube && tubeGrid()) ? gridCardW() : THUMB_W;
+    int wantH = (browseTube && tubeGrid()) ? gridCardH() : THUMB_H;
     for (StarThumb& t : starThumbs) {
         if (!t.used) continue;
         bool sizeOk = !t.sprite || (t.sprite->width() == wantW && t.sprite->height() == wantH);
@@ -1051,11 +1081,16 @@ void updateStarThumbs() {
         }
         t = StarThumb{};
     }
-    if (!jpg || panel != Panel::Browse || !youtube) return;
+    bool homeThumb = tube.playingId[0] && (tube.held || tube.busy || tube.phase[0]);
+    if (!jpg || ((panel != Panel::Browse || !youtube) && !homeThumb)) return;
     int made = 0;
     int nItems = ytStars ? tube.starCount : tube.count;
+    if (homeThumb && !browseTube) {
+        nItems = 1;
+    }
     for (int i = 0; i < nItems; i++) {
-        const char* id = ytStars ? tube.stars[i].id : tube.items[i].id;
+        const char* id = (!browseTube && homeThumb) ? tube.playingId : (ytStars ? tube.stars[i].id : tube.items[i].id);
+        if (!tubeThumbWanted(id)) continue;
         StarThumb* have = thumbFor(id);
         if (have && have->sprite) continue;
         StarThumb* slot = have;
@@ -1755,9 +1790,17 @@ void drawMain(M5Canvas& c) {
     }
 
     if (panel == Panel::Closed) {
+        bool pending = youtubePending();
         c.fillRoundRect(ART_X, ART_Y, ART, ART, 16, COL_CARD);
-        if (hasArt && art.getBuffer()) art.pushSprite(&c, ART_X, ART_Y);
-        else {
+        StarThumb* heldThumb = pending ? thumbFor(tube.playingId) : nullptr;
+        if (pending && heldThumb && heldThumb->sprite) {
+            M5Canvas* sp = heldThumb->sprite;
+            c.setClipRect(ART_X, ART_Y, ART, ART);
+            sp->pushSprite(&c, ART_X + (ART - sp->width()) / 2, ART_Y + (ART - sp->height()) / 2);
+            c.clearClipRect();
+        } else if (!pending && hasArt && art.getBuffer()) {
+            art.pushSprite(&c, ART_X, ART_Y);
+        } else {
             c.setFont(&fontBody);
             c.setTextColor(COL_MUTED);
             c.setTextDatum(MC_DATUM);
@@ -1767,8 +1810,9 @@ void drawMain(M5Canvas& c) {
 
         int tx = ART_X + ART + 28;
         int tw = c.width() - tx - 24;
-        bool haveTrack = view.title[0] != 0;
-        if (haveTrack && youtubeNow()) {
+        bool haveTrack = pending || view.title[0] != 0;
+        bool showStar = pending || (haveTrack && youtubeNow());
+        if (showStar) {
             tw -= 62;
             bool hot = pressedAt(STAR_NOW.x, STAR_NOW.y, STAR_NOW.w, STAR_NOW.h);
             bool on = isStarred(tube.playingId);
@@ -1777,38 +1821,48 @@ void drawMain(M5Canvas& c) {
         }
         int y = ART_Y;
         c.setClipRect(tx, ART_Y, tw + 8, PLAY.y - 8 - ART_Y);
-        if (haveTrack && view.source[0]) {
-            drawSource(c, tx, y, view.source);
+        const char* source = pending ? "YouTube" : view.source;
+        if (haveTrack && source[0]) {
+            drawSource(c, tx, y, source);
             y += 50;
         }
+        const char* titleText = pending ? (tube.playingTitle[0] ? tube.playingTitle : "YouTube")
+                                        : (haveTrack ? view.title : "Nothing playing");
         c.setFont(&fontTitle);
-        y += drawWrapped(c, haveTrack ? view.title : "Nothing playing", tx, y, tw, 2, COL_TEXT);
+        y += drawWrapped(c, titleText, tx, y, tw, 2, COL_TEXT);
         y += 10;
         c.setFont(&fontBody);
-        if (view.artist[0]) {
-            y += drawWrapped(c, view.artist, tx, y, tw, 1, COL_TEXT);
+        const char* artist = pending ? tube.playingChannel : view.artist;
+        if (artist[0]) {
+            y += drawWrapped(c, artist, tx, y, tw, 1, COL_TEXT);
             y += 6;
         }
-        if (view.album[0]) {
+        if (!pending && view.album[0]) {
             y += drawWrapped(c, view.album, tx, y, tw, 1, COL_MUTED);
             y += 6;
         }
-        if (view.status[0]) {
-            y += drawWrapped(c, view.status, tx, y, tw, 1, COL_WARN);
+        const char* status = pending && tube.phase[0] ? tube.phase : (!pending ? view.status : "");
+        if (status[0]) {
+            y += drawWrapped(c, status, tx, y, tw, 1, COL_WARN);
             y += 6;
         }
 
         if (haveTrack) {
             char left[16], right[16], line[40];
-            shortClock(view.rel, left, sizeof(left));
-            shortClock(view.dur, right, sizeof(right));
+            bool ytClock = pending || youtubeNow();
+            if (pending) strlcpy(left, "0:00", sizeof(left));
+            else shortClock(view.rel, left, sizeof(left));
+            int sonosDur = clockSeconds(view.dur);
+            int known = ytClock && tube.playingSeconds > 0 ? tube.playingSeconds : 0;
+            if (ytClock && sonosDur <= 0 && known > 0) formatSeconds(known, right, sizeof(right));
+            else shortClock(pending ? "" : view.dur, right, sizeof(right));
             snprintf(line, sizeof(line), "%s   /   %s", left, right);
             if (y > PLAY.y - 90) y = PLAY.y - 90;
             y += 8;
             text(c, line, tx, y, tw, COL_MUTED);
             y += c.fontHeight() + 10;
-            int total = clockSeconds(view.dur);
-            int pos = clockSeconds(view.rel);
+            int total = pending ? known : (sonosDur > 0 ? sonosDur : known);
+            int pos = pending ? 0 : clockSeconds(view.rel);
             int bw = tw > 40 ? tw : 40;
             c.fillRoundRect(tx, y, bw, 10, 5, COL_CARD2);
             if (total > 0) {
@@ -1827,8 +1881,11 @@ void drawMain(M5Canvas& c) {
             uint16_t fg = accent && !hot ? COL_BG : COL_TEXT;
             drawTransportIcon(c, b, kind, fg);
         };
+        char playKind = 'p';
+        if (youtubeRunning()) playKind = 'q';
+        else if (!pending && view.playing) playKind = 's';
         transport(PREV, '<', false);
-        transport(PLAY, view.playing ? 's' : 'p', true);
+        transport(PLAY, playKind, true);
         transport(NEXT, '>', false);
     } else {
         c.setFont(&fontUi);
@@ -2062,7 +2119,7 @@ void onTap(int x, int y) {
         }
         return;
     }
-    if (panel == Panel::Closed && view.title[0] && youtubeNow() && STAR_NOW.contains(x, y)) {
+    if (panel == Panel::Closed && tube.playingId[0] && (youtubePending() || youtubeNow()) && STAR_NOW.contains(x, y)) {
         yt::toggleStar(tube.playingId, tube.playingTitle, tube.playingChannel);
         return;
     }
@@ -2070,11 +2127,22 @@ void onTap(int x, int y) {
         sonos::command(sonos::Cmd::Mute, view.muted ? 0 : 1, nullptr);
         return;
     }
+    if (panel == Panel::Closed && youtubeWaiting() &&
+        (PREV.contains(x, y) || PLAY.contains(x, y) || NEXT.contains(x, y))) {
+        return;
+    }
+    if (panel == Panel::Closed && tube.phase[0] && (PREV.contains(x, y) || NEXT.contains(x, y))) return;
     if (panel == Panel::Closed && PREV.contains(x, y)) {
         sonos::command(sonos::Cmd::Prev, 0, nullptr);
         return;
     }
     if (panel == Panel::Closed && PLAY.contains(x, y)) {
+        bool restart = tube.held && tube.playingId[0] && !youtubeRunning();
+        if (restart) {
+            yt::requestResolve(tube.playingId);
+            return;
+        }
+        if (youtubeRunning()) yt::stopWatch();
         sonos::command(view.playing ? sonos::Cmd::Pause : sonos::Cmd::Play, 0, nullptr);
         return;
     }

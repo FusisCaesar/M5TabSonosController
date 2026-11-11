@@ -78,6 +78,8 @@ char* playedUrl = nullptr;
 char* fallbackUrl = nullptr;
 char* resolvedUrl = nullptr;  // address that answered the ranged probe, after redirects
 char fallbackTitle[80] = "";
+char priorTitle[100] = "";
+char priorSource[24] = "";
 bool triedRadio = false;
 bool triedRelay = false;
 volatile bool relayGo = false;
@@ -91,6 +93,47 @@ void setStatus(const char* text) {
     strlcpy(published.status, text ? text : "", sizeof(published.status));
     unlock();
     if (text && text[0]) Serial.printf("[yt] %s\n", text);
+}
+
+void setPhase(const char* text) {
+    lock();
+    bool changed = strcmp(published.phase, text ? text : "") != 0;
+    strlcpy(published.phase, text ? text : "", sizeof(published.phase));
+    unlock();
+    if (changed && text && text[0]) Serial.printf("[yt] %s\n", text);
+}
+
+void endBusy(const char* phase) {
+    lock();
+    published.busy = false;
+    strlcpy(published.phase, phase ? phase : "", sizeof(published.phase));
+    unlock();
+}
+
+void noteDetails(const char* id, const char* title, const char* channel, int seconds) {
+    lock();
+    if (id && id[0]) strlcpy(published.playingId, id, sizeof(published.playingId));
+    if (title && title[0]) strlcpy(published.playingTitle, title, sizeof(published.playingTitle));
+    if (channel && channel[0]) strlcpy(published.playingChannel, channel, sizeof(published.playingChannel));
+    if (seconds > 0) published.playingSeconds = seconds;
+    unlock();
+}
+
+// Caller holds the lock. keepIfSame leaves a restart's title and length in place.
+void holdPlayback(const sonos::View& speaker, const char* id, const char* title, const char* channel, int seconds,
+                  bool keepIfSame) {
+    bool same = keepIfSame && id && published.playingId[0] && !strcmp(published.playingId, id);
+    if (!same) {
+        strlcpy(published.playingId, id ? id : "", sizeof(published.playingId));
+        strlcpy(published.playingTitle, (title && title[0]) ? title : "YouTube", sizeof(published.playingTitle));
+        strlcpy(published.playingChannel, channel ? channel : "", sizeof(published.playingChannel));
+        published.playingSeconds = seconds > 0 ? seconds : 0;
+    }
+    published.held = true;
+    published.busy = true;
+    strlcpy(published.phase, "Opening YouTube", sizeof(published.phase));
+    strlcpy(priorTitle, speaker.title, sizeof(priorTitle));
+    strlcpy(priorSource, speaker.source, sizeof(priorSource));
 }
 
 bool videoIdOk(const char* id) {
@@ -332,14 +375,18 @@ void considerFormats(JsonArray arr, const char* tag, char* bestUrl, size_t bestC
 bool startRelay(const char* title);
 
 void resolveId(const char* id) {
-    if (!ensureBuf()) return;
-    setStatus("Opening YouTube");
+    if (!ensureBuf()) {
+        endBusy("Out of memory");
+        return;
+    }
+    setPhase("Opening YouTube");
     char* best = (char*)heap_caps_malloc(6500, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     char* payload = (char*)heap_caps_malloc(900, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!best || !payload) {
         heap_caps_free(best);
         heap_caps_free(payload);
         setStatus("Out of memory");
+        endBusy("Out of memory");
         return;
     }
     best[0] = 0;
@@ -407,6 +454,8 @@ void resolveId(const char* id) {
             strlcpy(author, gotAuthor, sizeof(author));
             cleanText(author);
         }
+        int lengthSeconds = doc["videoDetails"]["lengthSeconds"].as<int>();
+        noteDetails(id, title, author, lengthSeconds);
         const char* hls = doc["streamingData"]["hlsManifestUrl"] | "";
         Serial.printf("[yt] %s hls %u\n", tag, (unsigned)strlen(hls));
         int score = 0;
@@ -481,6 +530,7 @@ void resolveId(const char* id) {
             strlcpy(published.playingTitle, title, sizeof(published.playingTitle));
             strlcpy(published.playingChannel, author, sizeof(published.playingChannel));
             unlock();
+            setPhase("Starting the speaker");
             started = startRelay(title);
         }
         if (started && second[0]) {
@@ -508,12 +558,14 @@ void resolveId(const char* id) {
     heap_caps_free(best);
     heap_caps_free(payload);
     if (!played) {
-        if (!sawHttp) setStatus("YouTube busy");
-        else if (handed) setStatus("Speaker refused the stream");
-        else setStatus("No audio allowed for this video");
+        const char* why = !sawHttp ? "YouTube busy"
+                                   : handed ? "Speaker refused the stream" : "No audio allowed for this video";
+        setStatus(why);
+        endBusy(why);
         return;
     }
     setStatus("Playing");
+    endBusy("Starting the speaker");
 }
 
 // "Streamed 2 hours ago" -> "2 hrs". "4 days ago" -> "4 days". Empty when it does not match.
@@ -1748,12 +1800,37 @@ void begin() {
 
 void loop(bool online) {
     if (!online) return;
+    sonos::View speaker;
+    sonos::copyView(speaker);
+    lock();
+    bool waiting = !strcmp(published.phase, "Opening YouTube") || !strcmp(published.phase, "Starting the speaker");
+    bool arrived = speaker.playing && speaker.title[0] && !strcmp(speaker.source, "YouTube") &&
+                   published.playingTitle[0] && !strcmp(speaker.title, published.playingTitle);
+    if (waiting && arrived) published.phase[0] = 0;
+    if (!published.busy && published.held && speaker.title[0] && strcmp(speaker.source, "YouTube") != 0) {
+        bool same = priorTitle[0] && !strcmp(speaker.title, priorTitle) && !strcmp(speaker.source, priorSource);
+        if (!same) {
+            published.held = false;
+            published.phase[0] = 0;
+            published.playingId[0] = 0;
+            published.playingTitle[0] = 0;
+            published.playingChannel[0] = 0;
+            published.playingSeconds = 0;
+        }
+    }
+    unlock();
     if (checkAt && (int32_t)(millis() - checkAt) >= 0) {
         checkAt = 0;
-        sonos::View speaker;
-        sonos::copyView(speaker);
         Serial.printf("[yt] after start playing %d dur %s title %.60s\n", speaker.playing, speaker.dur, speaker.title);
-        if (!speaker.playing) setStatus("Speaker refused the stream");
+        if (!speaker.playing) {
+            setStatus("Speaker refused the stream");
+            lock();
+            if (published.held &&
+                (!published.phase[0] || !strcmp(published.phase, "Opening YouTube") ||
+                 !strcmp(published.phase, "Starting the speaker")))
+                strlcpy(published.phase, "Speaker refused the stream", sizeof(published.phase));
+            unlock();
+        }
     }
     if (seekAt && (int32_t)(millis() - seekAt) >= 0) {
         seekAt = 0;
@@ -1788,8 +1865,10 @@ void loop(bool online) {
     }
     unlock();
     if (resolve) {
-        if (!videoIdOk(id)) setStatus("Bad video id");
-        else resolveId(id);
+        if (!videoIdOk(id)) {
+            setStatus("Bad video id");
+            endBusy("Bad video id");
+        } else resolveId(id);
     } else if (search) {
         runSearch(false);
     } else if (more) {
@@ -1808,10 +1887,14 @@ void loop(bool online) {
 
 void requestResolve(const char* videoId) {
     if (!videoIdOk(videoId)) return;
+    sonos::View speaker;
+    sonos::copyView(speaker);
     lock();
+    holdPlayback(speaker, videoId, "YouTube", "", 0, true);
     strlcpy(wantId, videoId, sizeof(wantId));
     wantResolve = true;
     unlock();
+    Serial.println("[yt] Opening YouTube");
 }
 
 void requestSearch(const char* query) {
@@ -1831,14 +1914,28 @@ void requestMore() {
 }
 
 void requestPlay(int index) {
+    sonos::View speaker;
+    sonos::copyView(speaker);
     lock();
-    wantPlay = index;
+    bool ok = index >= 0 && index < published.count;
+    if (ok) {
+        const Item& it = published.items[index];
+        holdPlayback(speaker, it.id, it.title, it.channel, it.seconds, false);
+        wantPlay = index;
+    }
     unlock();
+    if (ok) Serial.println("[yt] Opening YouTube");
 }
 
 void requestSeek() {
     lock();
     wantSeek = true;
+    unlock();
+}
+
+void stopWatch() {
+    lock();
+    checkAt = 0;
     unlock();
 }
 
@@ -1906,12 +2003,18 @@ void starPlaying() {
 }
 
 void playStar(int index) {
+    sonos::View speaker;
+    sonos::copyView(speaker);
     lock();
-    if (index >= 0 && index < published.starCount) {
-        strlcpy(wantId, published.stars[index].id, sizeof(wantId));
+    bool ok = index >= 0 && index < published.starCount;
+    if (ok) {
+        const Item& it = published.stars[index];
+        holdPlayback(speaker, it.id, it.title, it.channel, it.seconds, false);
+        strlcpy(wantId, it.id, sizeof(wantId));
         wantResolve = true;
     }
     unlock();
+    if (ok) Serial.println("[yt] Opening YouTube");
 }
 
 size_t copyThumb(const char* id, uint8_t* dst, size_t cap) {

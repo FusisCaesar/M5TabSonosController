@@ -29,10 +29,14 @@ struct View {
     int starCount;
     Item stars[MAX_STARS];
     bool starThumb[MAX_STARS];
-    // The video the Tab5 last handed to the speaker.
+    // The video the Tab5 is starting, playing, or waiting to start again.
     char playingId[16];
     char playingTitle[80];
     char playingChannel[48];
+    int playingSeconds;  // from the search row, then the player response
+    bool held;           // keep showing it after the speaker stops, until another track starts
+    bool busy;           // a player request is in flight
+    char phase[48];      // "Opening YouTube", "Starting the speaker", or why it failed
 };
 
 void begin();
@@ -42,6 +46,8 @@ void requestSearch(const char* query);
 void requestMore();
 void requestPlay(int index);
 void requestSeek();
+// The user stopped the stream. Don't report that as the speaker refusing it.
+void stopWatch();
 void setClient(const char* name, const char* version, const char* ua);
 void copyView(View& out);
 
