@@ -355,11 +355,14 @@ The pack is 2S (an NP-F550 in the rear bay on this unit). `M5.Power.getBatteryVo
 
 Do not use `getBatteryLevel()` as the on-screen percentage. With no pack, on USB, the sense node collapses near 0 V and also sits on the charger rail, so a naive 0–100 clamp flaps between empty and full. `BAT 0%` for a moment after boot was a settle glitch, not an empty pack.
 
-The heuristic that settled, polled every 5 s:
+The heuristic that settled, polled every 5 s under the I2C lock:
 
-- Below 5.5 V: USB, no pack. Show that, not 0%.
-- From 6.0 V to 8.8 V: a real 2S pack. Trust it after 2 samples.
-- A missing pack also floats on the 8.4 V charger rail between collapses. A reading at or above 8.1 V has to persist for 6 samples (about 30 s) before it is treated as a pack.
+- Ignore 0 V and anything above 20 V. That is a failed read, not a missing pack. One bad sample used to flip the icon to USB.
+- Below 5.5 V: USB, no pack. Show that, not 0%. A pack that is already latched is dropped only after 3 low readings in a row.
+- From 6.0 V up to 8.1 V: a real 2S pack. Trust it after 2 samples. The gap from 5.5 V to 6.0 V changes nothing.
+- A missing pack also floats on the 8.4 V charger rail between collapses. A reading at or above 8.1 V has to persist for 6 samples (about 30 s) before it is treated as a pack, unless current is clearly moving (above 40 mA or below −40 mA) or the charge pin says so. Then 2 samples are enough. Once a pack is latched, a later high reading updates the percentage immediately.
+- `isCharging()` is expander 1 pin 6 (`CHG_STAT`). It blips near a full charge, so it has to agree for 2 samples.
+- Plugged in means USB with no pack, that charge pin, charge current, or (while the backlight is on) a latched pack that is not discharging. Two samples either way. On battery the screen always turns off. Plugged in, it can show the playing picture instead.
 - Percentage is per cell, `packMv / 2`, empty at 3.30 V, full at 4.15 V.
 
 The RTC is the RX8130CE, kept by the on-board supercap. Its interrupt does not land on a P4 GPIO directly; a small PMS150G sits in between. Set the clock from NTP when Wi-Fi is up, or from a GPS time sentence. A year of 2024 or later means the RTC was already set. Store UTC in logs if you also show a local zone.
@@ -413,7 +416,7 @@ Leave the rowing screens, metrics, sessions, maps, and the `case/` CAD files. Th
 | GPS NMEA flows, fix never sticks | TinyGPSPlus drops RMC speed unless status is `A`, and a GGA clears it if you require `speed.isUpdated()` |
 | GPS silent | 5 V not on, Port A still in I2C mode, or the other pin order. Scan both |
 | Wi-Fi associates and the UI is frozen | `WiFi.begin` was called on the draw path |
-| `BAT` flaps 0% and 100% on USB with no pack | Sense node collapses and also sits on the 8.4 V charger rail. Use the 5.5 V / 8.1 V heuristic |
+| `BAT` flaps 0% and 100% on USB with no pack | Sense node collapses and also sits on the 8.4 V charger rail. Use the 5.5 V / 8.1 V heuristic. Do not drop a latched pack on one low reading |
 | `nvs_open` error at boot | `Preferences::begin` was read-only |
 | Unaligned load exception while parsing a file | Cast of packed bytes to `int32_t*`. `memcpy` |
 | Allocation of a framebuffer fails, heap still looks fine | It was aimed at internal RAM. Use PSRAM |

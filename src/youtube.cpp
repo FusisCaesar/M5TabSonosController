@@ -523,8 +523,13 @@ void resolveId(const char* id) {
             triedRelay = false;
             strlcpy(fallbackTitle, title, sizeof(fallbackTitle));
             char thumb[96];
-            snprintf(thumb, sizeof(thumb), "http://i.ytimg.com/vi/%s/mqdefault.jpg", id);
+            snprintf(thumb, sizeof(thumb), "http://i.ytimg.com/vi/%s/hq720.jpg", id);
             sonos::setDirectInfo(title, author, thumb);
+            Preferences prefs;
+            if (prefs.begin("yt", false)) {
+                prefs.putString("id", id);
+                prefs.end();
+            }
             lock();
             strlcpy(published.playingId, id, sizeof(published.playingId));
             strlcpy(published.playingTitle, title, sizeof(published.playingTitle));

@@ -61,6 +61,8 @@ constexpr Box STAR_NOW{1210, 136, 46, 46};  // star beside the title while YouTu
 
 M5Canvas canvas;
 M5Canvas art;
+M5Canvas coverPic;  // the playing picture at cover size, so it is not a blown-up thumbnail
+int coverGen = -1;
 uint8_t* jpg = nullptr;
 constexpr size_t JPG_CAP = 1024 * 1024;
 bool ready = false;
@@ -93,7 +95,9 @@ int flashX = 0, flashY = 0;
 uint32_t lastActivity = 0;
 int sleepMin = 5;
 int clickLevel = 1;  // 0 off, 1 low, 2 high
+bool showCover = true;  // plugged in, show the playing picture instead of turning the backlight off
 bool asleep = false;
+bool coverMode = false;
 bool swallowTouch = false;
 bool speakerReady = false;
 
@@ -134,11 +138,19 @@ void startSpeaker() {
 struct PowerView {
     bool known = false;
     bool onUsb = false;
+    bool onExternal = false;  // USB with no pack, or a pack that is being charged
     bool charging = false;
+    bool packLatched = false;
     int pct = -1;
     int mv = 0;
     int ma = 0;
-    int packSamples = 0;
+    int midSamples = 0;
+    int highSamples = 0;
+    int lowSamples = 0;
+    int chargeOn = 0;
+    int chargeOff = 0;
+    int extOn = 0;
+    int extOff = 0;
 } power;
 
 int cellPercent(int packMv) {
@@ -149,35 +161,107 @@ int cellPercent(int packMv) {
     return p;
 }
 
+void notePack(int mv) {
+    power.packLatched = true;
+    power.onUsb = false;
+    power.pct = cellPercent(mv);
+    power.lowSamples = 0;
+}
+
 void servicePower() {
     static uint32_t next = 0;
     if (millis() < next) return;
     next = millis() + 5000;
     int mv = 0, ma = 0;
-    bool charging = false;
+    bool chargingPin = false;
     {
         board::I2CLock lock;
         mv = M5.Power.getBatteryVoltage();
         ma = M5.Power.getBatteryCurrent();
-        charging = M5.Power.isCharging();
+        chargingPin = M5.Power.isCharging();
     }
+    power.known = true;
+    // A failed read comes back as 0 and used to flip a plugged-in pack over to "USB" for one sample.
+    if (mv <= 0 || mv > 20000) {
+        if (!power.packLatched) {
+            power.midSamples = 0;
+            power.highSamples = 0;
+        }
+        return;
+    }
+    bool prevUsb = power.onUsb;
+    bool prevChg = power.charging;
+    bool prevExt = power.onExternal;
     power.mv = mv;
     power.ma = ma;
-    power.charging = charging;
-    power.known = true;
-    // The fuel gauge sits on the charger rail when no pack is fitted, so a single high reading is
-    // not a battery. The thresholds are the ones that settled on this board.
-    if (mv >= 6000 && mv <= 8800) {
-        power.packSamples++;
-        if (power.packSamples >= 2) {
-            power.onUsb = false;
-            power.pct = cellPercent(mv);
+
+    // Handover thresholds. Below 5.5 V is USB with no pack. 6.0–8.1 V is a real 2S pack.
+    // At or above 8.1 V the empty bay also floats on the charger rail, so that band has to hold
+    // for 6 samples before it counts as a pack. Once a pack is latched, one low sample does not
+    // drop it; three in a row do.
+    bool low = mv < 5500;
+    bool mid = mv >= 6000 && mv < 8100;
+    bool high = mv >= 8100 && mv <= 8800;
+    if (mid) {
+        power.lowSamples = 0;
+        power.highSamples = 0;
+        power.midSamples++;
+        if (power.packLatched || power.midSamples >= 2) notePack(mv);
+    } else if (high) {
+        power.lowSamples = 0;
+        power.midSamples = 0;
+        power.highSamples++;
+        // A floating empty bay sits on the 8.4 V rail with no current. A pack that is charging
+        // or running the tablet moves current, so two samples are enough.
+        int need = 6;
+        if (power.packLatched) need = 1;
+        else if (ma > 40 || ma < -40 || chargingPin) need = 2;
+        if (power.highSamples >= need) notePack(mv);
+    } else if (low) {
+        power.midSamples = 0;
+        power.highSamples = 0;
+        power.lowSamples++;
+        int need = power.packLatched ? 3 : 1;
+        if (power.lowSamples >= need) {
+            power.packLatched = false;
+            power.onUsb = true;
+            power.pct = -1;
         }
-    } else if (mv < 5500) {
-        power.onUsb = true;
-        power.pct = -1;
-        power.packSamples = 0;
+    } else if (!power.packLatched) {
+        power.midSamples = 0;
+        power.highSamples = 0;
     }
+
+    // CHG_STAT (expander pin 6) blips near a full charge. Two agreeing samples move the flag.
+    if (chargingPin) {
+        power.chargeOn++;
+        power.chargeOff = 0;
+    } else {
+        power.chargeOff++;
+        power.chargeOn = 0;
+    }
+    if (power.chargeOn >= 2) power.charging = true;
+    if (power.chargeOff >= 2) power.charging = false;
+
+    // Plugged in: no pack on USB, the charger says so, or current is actually flowing in.
+    // A pack that is only discharging is battery, and the screen then sleeps.
+    // A full pack on the charger sits near 0 mA with the charge pin off. With the backlight on, a
+    // battery would be discharging, so a pack that is not discharging is on external power.
+    bool screenLit = !asleep;
+    bool extSample = power.onUsb || power.charging || ma > 40;
+    if (screenLit && power.packLatched && ma > -100) extSample = true;
+    if (extSample) {
+        power.extOn++;
+        power.extOff = 0;
+    } else {
+        power.extOff++;
+        power.extOn = 0;
+    }
+    if (power.extOn >= 2) power.onExternal = true;
+    if (power.extOff >= 2) power.onExternal = false;
+    if (prevExt != power.onExternal || prevUsb != power.onUsb || prevChg != power.charging)
+        Serial.printf("[ui] power %s %d mV %d mA %s\n", power.onUsb ? "usb" : "pack", mv, ma,
+                      power.onExternal ? "external" : "battery");
 }
 
 // Both landscape rotations are the same 1280x720 layout, so the canvas stays. Held on its short edge,
@@ -255,16 +339,39 @@ void setBrightness(int level) {
 
 void wakeScreen() {
     asleep = false;
+    coverMode = false;
     lastActivity = millis();
     setBrightness(200);
 }
 
+bool coverArtReady();
+void drawCover(M5Canvas& c);
+
+// On battery the backlight always turns off. Plugged in, the cover can stay up instead.
+bool wantCover() {
+    return showCover && power.known && power.onExternal && coverArtReady();
+}
+
 void serviceSleep() {
     if (sleepMin <= 0) {
-        if (asleep) wakeScreen();
+        if (asleep || coverMode) wakeScreen();
         return;
     }
-    if (!asleep && lastActivity && millis() - lastActivity > (uint32_t)sleepMin * 60000UL) {
+    bool idle = lastActivity && millis() - lastActivity > (uint32_t)sleepMin * 60000UL;
+    if (!idle) return;
+    if (wantCover()) {
+        if (asleep) {
+            asleep = false;
+            setBrightness(200);
+        }
+        if (!coverMode) {
+            coverMode = true;
+            Serial.println("[ui] showing the cover");
+        }
+        return;
+    }
+    if (coverMode || !asleep) {
+        coverMode = false;
         asleep = true;
         setBrightness(0);
         Serial.printf("[ui] screen off after %d min\n", sleepMin);
@@ -276,6 +383,7 @@ void loadSleep() {
     prefs.begin("ui", true);
     int saved = prefs.getInt("sleep", 5);
     int click = prefs.getInt("click", 1);
+    showCover = prefs.getInt("cover", 1) != 0;
     prefs.end();
     if (saved == 0 || saved == 1 || saved == 5 || saved == 15 || saved == 30) sleepMin = saved;
     if (click >= 0 && click <= 2) clickLevel = click;
@@ -288,6 +396,16 @@ void storeSleep(int minutes) {
     prefs.begin("ui", false);
     prefs.putInt("sleep", minutes);
     prefs.end();
+}
+
+void storeCover(bool on) {
+    showCover = on;
+    lastActivity = millis();
+    Preferences prefs;
+    prefs.begin("ui", false);
+    prefs.putInt("cover", on ? 1 : 0);
+    prefs.end();
+    if (!on && coverMode) wakeScreen();
 }
 
 void storeClick(int level) {
@@ -1522,12 +1640,15 @@ int actY() { return 456; }
 const int SLEEP_MINS[] = {0, 1, 5, 15, 30};
 const char* SLEEP_LABELS[] = {"Off", "1 min", "5 min", "15 min", "30 min"};
 constexpr int SLEEP_N = 5;
-constexpr int SLEEP_Y = 286;
-constexpr int SLEEP_H = 88;
-constexpr int CLICK_Y = 460;
-constexpr int CLICK_H = 80;
+constexpr int SLEEP_Y = 260;
+constexpr int SLEEP_H = 72;
+constexpr int CLICK_Y = 376;
+constexpr int CLICK_H = 68;
 constexpr int CLICK_W = 400;
 constexpr int SLEEP_W = 232;
+constexpr int COVER_Y = 488;
+constexpr int COVER_H = 68;
+constexpr int COVER_W = (FIELD_W - 16) / 2;
 
 int sleepX(int i) { return FIELD_X + i * (SLEEP_W + 16); }
 
@@ -1619,9 +1740,10 @@ void drawSettings(M5Canvas& c) {
 
     if (settingsTab == 1) {
         c.setFont(&fontBody);
-        text(c, "The backlight turns off after the screen is left alone. Music keeps playing.", FIELD_X, 200,
+        text(c, "Left alone, the screen turns off. Music keeps playing, and the next tap only wakes it.",
+             FIELD_X, 188, FIELD_W, COL_MUTED);
+        text(c, "On battery it always turns off. Plugged in, it can show the picture instead.", FIELD_X, 220,
              FIELD_W, COL_MUTED);
-        text(c, "The next tap only wakes it.", FIELD_X, 240, FIELD_W, COL_MUTED);
         for (int i = 0; i < SLEEP_N; i++) {
             int x = sleepX(i);
             bool on = sleepMin == SLEEP_MINS[i];
@@ -1648,6 +1770,21 @@ void drawSettings(M5Canvas& c) {
             c.drawString(clickLabels[i], x + CLICK_W / 2, CLICK_Y + CLICK_H / 2);
             c.setTextDatum(TL_DATUM);
         }
+        c.setFont(&fontBody);
+        c.setTextColor(COL_MUTED);
+        c.drawString("When it is plugged in", FIELD_X, COVER_Y - 32);
+        const char* coverLabels[] = {"Turn off", "Show the picture"};
+        for (int i = 0; i < 2; i++) {
+            int x = FIELD_X + i * (COVER_W + 16);
+            bool on = showCover == (i == 1);
+            bool hot = pressedAt(x, COVER_Y, COVER_W, COVER_H);
+            c.fillRoundRect(x, COVER_Y, COVER_W, COVER_H, 16, (on || hot) ? COL_ACCENT : COL_CARD);
+            c.setFont(&fontUi);
+            c.setTextColor((on || hot) ? COL_BG : COL_TEXT);
+            c.setTextDatum(MC_DATUM);
+            c.drawString(coverLabels[i], x + COVER_W / 2, COVER_Y + COVER_H / 2);
+            c.setTextDatum(TL_DATUM);
+        }
         return;
     }
 
@@ -1655,7 +1792,7 @@ void drawSettings(M5Canvas& c) {
     char bat[64], up[32], mem[48], sig[32], rooms[24], screen[40];
     if (power.known && power.pct >= 0) {
         snprintf(bat, sizeof(bat), "%d%%   %d mV   %d mA%s", power.pct, power.mv, power.ma,
-                 power.charging ? "   charging" : "");
+                 power.charging ? "   charging" : (power.onExternal ? "   plugged in" : ""));
     } else if (power.known) {
         snprintf(bat, sizeof(bat), "%s   %d mV", pack, power.mv);
     } else {
@@ -2062,7 +2199,7 @@ void onSettingsTap(int x, int y) {
             int cx = sleepX(i);
             if (x >= cx && x < cx + SLEEP_W) {
                 storeSleep(SLEEP_MINS[i]);
-                if (SLEEP_MINS[i] == 0 && asleep) wakeScreen();
+                if (SLEEP_MINS[i] == 0 && (asleep || coverMode)) wakeScreen();
                 return;
             }
         }
@@ -2072,6 +2209,15 @@ void onSettingsTap(int x, int y) {
             int cx = FIELD_X + i * (CLICK_W + 16);
             if (x >= cx && x < cx + CLICK_W) {
                 storeClick(i);
+                return;
+            }
+        }
+    }
+    if (settingsTab == 1 && y >= COVER_Y && y < COVER_Y + COVER_H) {
+        for (int i = 0; i < 2; i++) {
+            int cx = FIELD_X + i * (COVER_W + 16);
+            if (x >= cx && x < cx + COVER_W) {
+                storeCover(i == 1);
                 return;
             }
         }
@@ -2500,6 +2646,149 @@ void endGesture(int x, int y) {
     if (view.volume == localVol) freezeVol = false;
 }
 
+bool coverArtReady() {
+    bool picture = (hasArt && art.getBuffer()) || coverPic.getBuffer();
+    if (tube.playingId[0]) {
+        StarThumb* th = thumbFor(tube.playingId);
+        if (th && th->sprite && th->sprite->getBuffer()) picture = true;
+    }
+    if (!picture) return false;
+    if (view.playing || view.title[0]) return true;
+    return tube.playingId[0] && (youtubePending() || tube.held);
+}
+
+bool imageSize(const uint8_t* p, size_t n, int* w, int* h) {
+    if (n >= 24 && p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G') {
+        *w = (p[16] << 24) | (p[17] << 16) | (p[18] << 8) | p[19];
+        *h = (p[20] << 24) | (p[21] << 16) | (p[22] << 8) | p[23];
+        return *w > 0 && *h > 0 && *w < 8000 && *h < 8000;
+    }
+    if (n < 4 || p[0] != 0xFF || p[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 9 < n) {
+        if (p[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        uint8_t m = p[i + 1];
+        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+            i += 2;
+            continue;
+        }
+        if (m == 0xD9) return false;
+        int len = (p[i + 2] << 8) | p[i + 3];
+        if (len < 2 || i + 2 + (size_t)len > n) return false;
+        if (m == 0xC0 || m == 0xC1 || m == 0xC2) {
+            *h = (p[i + 5] << 8) | p[i + 6];
+            *w = (p[i + 7] << 8) | p[i + 8];
+            return *w > 0 && *h > 0 && *w < 8000 && *h < 8000;
+        }
+        i += 2 + (size_t)len;
+    }
+    return false;
+}
+
+void blitSmooth(M5Canvas& c, M5Canvas* sp) {
+    int sw = sp->width();
+    int sh = sp->height();
+    if (sw < 1 || sh < 1) return;
+    int maxW = c.width() - 80;
+    int maxH = c.height() - 150;
+    float zoom = (float)maxW / sw;
+    float zy = (float)maxH / sh;
+    if (zy < zoom) zoom = zy;
+    sp->setPivot(sw / 2.0f, sh / 2.0f);
+    sp->pushRotateZoomWithAA(&c, c.width() / 2.0f, (c.height() - 110) / 2.0f, 0.0f, zoom, zoom);
+}
+
+// Decode the original picture once, at the size the cover shows, instead of enlarging the 180px sprite.
+void prepareCoverPic() {
+    if (!jpg || view.artGen == coverGen) return;
+    int gen = 0;
+    size_t n = sonos::copyArt(jpg, JPG_CAP, &gen);
+    coverGen = gen;
+    if (coverPic.getBuffer()) coverPic.deleteSprite();
+    if (n < 32) return;
+    int iw = 0, ih = 0;
+    if (!imageSize(jpg, n, &iw, &ih)) return;
+    int maxW = 1200;
+    int maxH = 570;
+    float fit = (float)maxW / iw;
+    float fy = (float)maxH / ih;
+    if (fy < fit) fit = fy;
+    int dw = (int)(iw * fit + 0.5f);
+    int dh = (int)(ih * fit + 0.5f);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    bool jpeg = jpg[0] == 0xFF && jpg[1] == 0xD8;
+    bool png = jpg[0] == 0x89 && jpg[1] == 'P';
+    auto top = lgfx::v1::textdatum::top_left;
+    M5Canvas native;
+    native.setColorDepth(16);
+    native.setPsram(true);
+    native.createSprite(iw, ih);
+    bool decoded = false;
+    if (native.getBuffer()) {
+        if (jpeg) decoded = native.drawJpg(jpg, n, 0, 0, iw, ih, 0, 0, 1.0f, 1.0f, top);
+        else if (png) decoded = native.drawPng(jpg, n, 0, 0, iw, ih, 0, 0, 1.0f, 1.0f, top);
+    }
+    if (!decoded) {
+        native.deleteSprite();
+        return;
+    }
+    coverPic.setColorDepth(16);
+    coverPic.setPsram(true);
+    coverPic.createSprite(dw, dh);
+    if (!coverPic.getBuffer()) {
+        native.deleteSprite();
+        return;
+    }
+    coverPic.fillSprite(TFT_BLACK);
+    native.setPivot(iw / 2.0f, ih / 2.0f);
+    native.pushRotateZoomWithAA(&coverPic, dw / 2.0f, dh / 2.0f, 0.0f, fit, fit);
+    native.deleteSprite();
+    Serial.printf("[ui] cover picture %dx%d from %dx%d\n", dw, dh, iw, ih);
+}
+
+void drawCover(M5Canvas& c) {
+    c.fillSprite(TFT_BLACK);
+    c.setTextDatum(TL_DATUM);
+    prepareCoverPic();
+    if (coverPic.getBuffer()) {
+        int x = (c.width() - coverPic.width()) / 2;
+        int y = ((c.height() - 110) - coverPic.height()) / 2;
+        if (y < 16) y = 16;
+        coverPic.pushSprite(&c, x, y);
+    } else {
+        M5Canvas* sp = nullptr;
+        if (hasArt && art.getBuffer()) sp = &art;
+        else if (tube.playingId[0]) {
+            StarThumb* th = thumbFor(tube.playingId);
+            if (th && th->sprite && th->sprite->getBuffer()) sp = th->sprite;
+        }
+        if (sp) blitSmooth(c, sp);
+    }
+
+    const char* title = view.title;
+    const char* artist = view.artist;
+    if (tube.playingTitle[0] && (youtubePending() || (tube.held && !view.title[0]))) {
+        title = tube.playingTitle;
+        artist = tube.playingChannel;
+    }
+    c.setTextDatum(MC_DATUM);
+    c.setFont(&fontTitle);
+    c.setTextColor(COL_TEXT);
+    c.setClipRect(40, c.height() - 120, c.width() - 80, 52);
+    c.drawString(title[0] ? title : " ", c.width() / 2, c.height() - 96);
+    c.clearClipRect();
+    c.setFont(&fontBody);
+    c.setTextColor(COL_MUTED);
+    c.setClipRect(40, c.height() - 68, c.width() - 80, 44);
+    if (artist[0]) c.drawString(artist, c.width() / 2, c.height() - 48);
+    c.clearClipRect();
+    c.setTextDatum(TL_DATUM);
+}
+
 }  // namespace
 
 void begin() {
@@ -2578,7 +2867,7 @@ void loop() {
     serviceSleep();
 
     auto t = M5.Touch.getDetail();
-    if (asleep) {
+    if (asleep || coverMode) {
         if (t.wasPressed()) {
             wakeScreen();
             swallowTouch = true;
@@ -2594,13 +2883,18 @@ void loop() {
     if (tapPending) {
         tapPending = false;
         lastActivity = millis();
-        if (asleep) wakeScreen();
+        if (asleep || coverMode) wakeScreen();
         else onTap(tapX, tapY);
     }
     if (net::connected()) maybeDecode();
     if (net::connected()) updateStarThumbs();
     if (net::connected()) updateSpotifyThumbs();
-    if (net::connected()) drawMain(canvas);
+    if (!coverMode && coverPic.getBuffer()) {
+        coverPic.deleteSprite();
+        coverGen = -1;
+    }
+    if (coverMode) drawCover(canvas);
+    else if (net::connected()) drawMain(canvas);
     else if (panel == Panel::Settings) {
         canvas.fillSprite(COL_BG);
         canvas.setTextDatum(TL_DATUM);

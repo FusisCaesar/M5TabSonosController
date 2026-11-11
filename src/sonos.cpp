@@ -934,6 +934,16 @@ void considerArt(const char* uri, const char* ip) {
     bool png = got >= 8 && art[back][0] == 0x89 && art[back][1] == 'P' && art[back][2] == 'N' && art[back][3] == 'G';
     bool ok = code == 200 && written > 0 && (jpeg || png);
     http.end();
+    if (!ok && strstr(url, "/hq720.jpg")) {
+        // Some videos have no 720p frame. The 480p one is still far sharper than the list thumbnail.
+        char* d = strstr(directArt, "/hq720.jpg");
+        if (d && strlen(directArt) + 4 < sizeof(directArt)) {
+            memmove(d + 15, d + 11, strlen(d + 11) + 1);
+            memcpy(d, "/hqdefault.jpg", 15);
+            Serial.println("[sonos] art falling back to hqdefault");
+            return;
+        }
+    }
     if (!ok) {
         artRetryAt = millis() + 15000;
         unsigned m0 = got ? art[back][0] : 0;
@@ -1159,12 +1169,23 @@ bool getPosition(const char* ip) {
         pickArt(trackBuf, pickedArt, sizeof(pickedArt));
     }
     classifySource(trackUri[0] ? trackUri : pickedArt, source, sizeof(source));
-    if (directTitle[0] && strstr(trackUri, ":8080/yt/")) {
-        strlcpy(title, directTitle, sizeof(title));
-        strlcpy(artist, directArtist, sizeof(artist));
-        album[0] = 0;
+    if (strstr(trackUri, ":8080/yt/")) {
+        if (directTitle[0]) {
+            strlcpy(title, directTitle, sizeof(title));
+            strlcpy(artist, directArtist, sizeof(artist));
+            album[0] = 0;
+        }
         strlcpy(source, "YouTube", sizeof(source));
-        strlcpy(pickedArt, directArt, sizeof(pickedArt));
+        if (!directArt[0]) {
+            Preferences prefs;
+            if (prefs.begin("yt", true)) {
+                String id = prefs.getString("id");
+                if (id.length() >= 6 && id.length() < 16)
+                    snprintf(directArt, sizeof(directArt), "http://i.ytimg.com/vi/%s/hq720.jpg", id.c_str());
+                prefs.end();
+            }
+        }
+        if (directArt[0]) strlcpy(pickedArt, directArt, sizeof(pickedArt));
     }
     if (strcmp(title, lastTitle) != 0) {
         Serial.printf("[sonos] now '%s' / '%s' art %u\n", title, artist, (unsigned)strlen(pickedArt));
@@ -2298,7 +2319,13 @@ bool playDirect(const char* uri, const char* title) {
         "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
         "<item id=\"yt\" parentID=\"-1\" restricted=\"true\"><dc:title>");
     d.xml(title && title[0] ? title : "YouTube");
-    d.s("</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
+    d.s("</dc:title>");
+    if (directArt[0]) {
+        d.s("<upnp:albumArtURI>");
+        d.xml(directArt);
+        d.s("</upnp:albumArtURI>");
+    }
+    d.s("<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>"
         "<res protocolInfo=\"x-rincon-mp3radio:*:*:*\">");
     d.xml(uri);
     d.s("</res></item></DIDL-Lite>");
