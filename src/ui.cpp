@@ -177,17 +177,26 @@ void notePack(int mv) {
     power.lowSamples = 0;
 }
 
+void forgetPack() {
+    power.packLatched = false;
+    power.onUsb = true;
+    power.pct = -1;
+    power.charging = false;
+    power.chargeOn = 0;
+    power.lowSamples = 0;
+    power.highSamples = 0;
+    power.midSamples = 0;
+}
+
 void servicePower() {
     static uint32_t next = 0;
     if (millis() < next) return;
     next = millis() + 5000;
     int mv = 0, ma = 0;
-    bool chargingPin = false;
     {
         board::I2CLock lock;
         mv = M5.Power.getBatteryVoltage();
         ma = M5.Power.getBatteryCurrent();
-        chargingPin = M5.Power.isCharging();
     }
     power.known = true;
     // A failed read comes back as 0 and used to flip a plugged-in pack over to "USB" for one sample.
@@ -201,48 +210,58 @@ void servicePower() {
     bool prevUsb = power.onUsb;
     bool prevChg = power.charging;
     bool prevExt = power.onExternal;
+    int prevMv = power.mv;
     power.mv = mv;
     power.ma = ma;
 
     // Handover thresholds. Below 5.5 V is USB with no pack. 6.0–8.1 V is a real 2S pack.
-    // At or above 8.1 V the empty bay also floats on the charger rail, so that band has to hold
-    // for 6 samples before it counts as a pack. Once a pack is latched, one low sample does not
-    // drop it; three in a row do.
+    // At or above 8.1 V the empty bay floats on the charger rail, and the charger can push a
+    // little current into that empty node. With no pack the reading also flips to about 4.2 V.
+    // That swing is not a battery. A steady full pack does not do it.
     bool low = mv < 5500;
     bool mid = mv >= 6000 && mv < 8100;
     bool high = mv >= 8100 && mv <= 8800;
+    bool packHere = ma < -40 || ma > 80;
+    int swing = mv - prevMv;
+    if (swing < 0) swing = -swing;
+    bool emptyFlip = power.packLatched && prevMv > 1000 && swing > 3000 &&
+                     ((low && prevMv >= 6000) || (mv >= 6000 && prevMv < 5500));
+    if (emptyFlip) forgetPack();
     if (mid) {
         power.lowSamples = 0;
         power.highSamples = 0;
         power.midSamples++;
         if (power.packLatched || power.midSamples >= 2) notePack(mv);
     } else if (high) {
-        power.lowSamples = 0;
         power.midSamples = 0;
-        power.highSamples++;
-        // A floating empty bay sits on the 8.4 V rail with no current. A pack that is charging
-        // or running the tablet moves current, so two samples are enough.
-        int need = 6;
-        if (power.packLatched) need = 1;
-        else if (ma > 40 || ma < -40 || chargingPin) need = 2;
-        if (power.highSamples >= need) notePack(mv);
+        if (power.packLatched && power.lowSamples > 0 && !packHere) {
+            // A collapse already happened. The rail reading is the empty bay, not a full pack.
+            forgetPack();
+        } else if (power.packLatched) {
+            notePack(mv);
+        } else if (packHere) {
+            // Leaving the pack, or a real charge into it. The empty bay only leaks a little.
+            power.highSamples++;
+            if (power.highSamples >= 2) notePack(mv);
+        } else {
+            power.highSamples = 0;
+            power.onUsb = true;
+            power.pct = -1;
+        }
     } else if (low) {
         power.midSamples = 0;
         power.highSamples = 0;
         power.lowSamples++;
         int need = power.packLatched ? 3 : 1;
-        if (power.lowSamples >= need) {
-            power.packLatched = false;
-            power.onUsb = true;
-            power.pct = -1;
-        }
+        if (power.lowSamples >= need) forgetPack();
     } else if (!power.packLatched) {
         power.midSamples = 0;
         power.highSamples = 0;
     }
 
-    // CHG_STAT (expander pin 6) blips near a full charge. Two agreeing samples move the flag.
-    if (chargingPin) {
+    // Tab5 isCharging() is only "current above 10 mA". The empty bay clears that, so the
+    // icon says charging only for a pack that is actually taking current.
+    if (power.packLatched && ma > 40) {
         power.chargeOn++;
         power.chargeOff = 0;
     } else {
@@ -252,10 +271,10 @@ void servicePower() {
     if (power.chargeOn >= 2) power.charging = true;
     if (power.chargeOff >= 2) power.charging = false;
 
-    // Plugged in: no pack on USB, the charger says so, or current is actually flowing in.
+    // Plugged in: no pack on USB, a pack that is taking charge, or current flowing in.
     // A pack that is only discharging is battery, and the screen then sleeps.
-    // A full pack on the charger sits near 0 mA with the charge pin off. With the backlight on, a
-    // battery would be discharging, so a pack that is not discharging is on external power.
+    // A full pack on the charger sits near 0 mA. With the backlight on, a battery would be
+    // discharging, so a pack that is not discharging is on external power.
     bool screenLit = !asleep;
     bool extSample = power.onUsb || power.charging || ma > 40;
     if (screenLit && power.packLatched && ma > -100) extSample = true;
@@ -271,6 +290,7 @@ void servicePower() {
     if (prevExt != power.onExternal || prevUsb != power.onUsb || prevChg != power.charging)
         Serial.printf("[ui] power %s %d mV %d mA %s\n", power.onUsb ? "usb" : "pack", mv, ma,
                       power.onExternal ? "external" : "battery");
+    if (!power.packLatched || power.lowSamples > 0) next = millis() + 2000;
 }
 
 // Both landscape rotations are the same 1280x720 layout, so the canvas stays. Held on its short edge,
@@ -431,13 +451,37 @@ char wifiSsid[33] = "";
 char wifiPass[65] = "";
 int wifiField = 0;  // 1 network name, 2 password
 
+bool batteryShown() {
+    return power.known && power.packLatched && !power.onUsb && power.pct >= 0;
+}
+
+// The header icons sit just left of the battery. With no pack they take its place.
+Box placeHeader(const Box& b) {
+    Box o = b;
+    if (!batteryShown()) o.x += (BATT_X + 48) - (SET.x + SET.w);
+    return o;
+}
+
+void drawBolt(M5Canvas& c, int cx, int cy, uint16_t col) {
+    c.fillTriangle(cx + 2, cy - 6, cx - 5, cy, cx + 1, cy, col);
+    c.fillTriangle(cx - 2, cy - 1, cx + 5, cy - 1, cx - 1, cy + 6, col);
+}
+
 void drawBattery(M5Canvas& c, int x, int y) {
+    // USB with no pack is not a battery, so the icon stays off.
+    if (!batteryShown()) return;
     c.drawRoundRect(x, y, 44, 22, 3, COL_TEXT);
     c.fillRoundRect(x + 44, y + 6, 4, 10, 1, COL_TEXT);
-    if (!power.known || power.onUsb || power.pct < 0) return;
     int fill = 36 * power.pct / 100;
-    uint16_t col = power.pct < 15 ? COL_WARN : (power.charging ? COL_ACCENT : COL_TEXT);
+    uint16_t col = power.pct < 15 ? COL_WARN : COL_TEXT;
     if (fill > 0) c.fillRoundRect(x + 3, y + 3, fill, 16, 2, col);
+    if (!power.charging) return;
+    int cx = x + 20;
+    int cy = y + 11;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            if (dx || dy) drawBolt(c, cx + dx, cy + dy, COL_BG);
+    drawBolt(c, cx, cy, COL_ACCENT);
 }
 
 void drawSpeakerGlyph(M5Canvas& c, int x, int y, uint16_t body, uint16_t hole) {
@@ -646,9 +690,10 @@ void drawHomeHeader(M5Canvas& c, const char* label, bool muted) {
     c.setFont(&fontUi);
     c.setTextDatum(TL_DATUM);
     int y = HOME.y + (HOME.h - c.fontHeight()) / 2;
-    text(c, label, 104, y, BROWSE.x - 120, muted ? COL_MUTED : COL_TEXT);
+    int browseX = placeHeader(BROWSE).x;
+    text(c, label, 104, y, browseX - 120, muted ? COL_MUTED : COL_TEXT);
     int right = 104 + c.textWidth(label ? label : "");
-    homeNameRight = right < BROWSE.x - 16 ? right : BROWSE.x - 16;
+    homeNameRight = right < browseX - 16 ? right : browseX - 16;
 }
 
 bool homeHit(int x, int y) {
@@ -909,7 +954,7 @@ void drawWifi(M5Canvas& c) {
         centerLine(c, "Waiting for Wi-Fi", statusY, COL_MUTED);
     }
     drawBattery(c, BATT_X, BATT_Y);
-    drawHeaderButton(c, SET, 3, false);
+    drawHeaderButton(c, placeHeader(SET), 3, false);
 }
 
 const char* kindName(svc::Kind kind) {
@@ -1912,10 +1957,10 @@ void drawMain(M5Canvas& c) {
                        : (view.groupName[0] ? view.groupName : "No room");
     drawHomeHeader(c, room, !view.household);
     drawBattery(c, BATT_X, BATT_Y);
-    drawHeaderButton(c, BROWSE, 0, panel == Panel::Browse);
-    drawHeaderButton(c, QUEUE, 1, panel == Panel::Queue);
-    drawHeaderButton(c, FAV, 2, panel == Panel::Favs);
-    drawHeaderButton(c, SET, 3, panel == Panel::Settings);
+    drawHeaderButton(c, placeHeader(BROWSE), 0, panel == Panel::Browse);
+    drawHeaderButton(c, placeHeader(QUEUE), 1, panel == Panel::Queue);
+    drawHeaderButton(c, placeHeader(FAV), 2, panel == Panel::Favs);
+    drawHeaderButton(c, placeHeader(SET), 3, panel == Panel::Settings);
 
     c.drawFastHLine(0, 108, c.width(), COL_LINE);
     int roomsH = LIST_B - LIST_Y;
@@ -2339,7 +2384,11 @@ void onTap(int x, int y) {
         wifiField = 0;
         return;
     }
-    if (SET.contains(x, y)) {
+    Box setBtn = placeHeader(SET);
+    Box browseBtn = placeHeader(BROWSE);
+    Box queueBtn = placeHeader(QUEUE);
+    Box favBtn = placeHeader(FAV);
+    if (setBtn.contains(x, y)) {
         if (panel == Panel::Settings) {
             panel = Panel::Closed;
             keyboard = false;
@@ -2356,10 +2405,10 @@ void onTap(int x, int y) {
         if (panel == Panel::Settings) onSettingsTap(x, y);
         return;
     }
-    if (BROWSE.contains(x, y) || QUEUE.contains(x, y) || FAV.contains(x, y)) {
+    if (browseBtn.contains(x, y) || queueBtn.contains(x, y) || favBtn.contains(x, y)) {
         Panel next = Panel::Favs;
-        if (BROWSE.contains(x, y)) next = Panel::Browse;
-        else if (QUEUE.contains(x, y)) next = Panel::Queue;
+        if (browseBtn.contains(x, y)) next = Panel::Browse;
+        else if (queueBtn.contains(x, y)) next = Panel::Queue;
         if (panel == next) panel = Panel::Closed;
         else {
             panel = next;
@@ -3036,7 +3085,7 @@ void loop() {
         canvas.setTextColor(COL_TEXT);
         drawHomeHeader(canvas, "Not connected", true);
         drawBattery(canvas, BATT_X, BATT_Y);
-        drawHeaderButton(canvas, SET, 3, true);
+        drawHeaderButton(canvas, placeHeader(SET), 3, true);
         canvas.drawFastHLine(0, 108, canvas.width(), COL_LINE);
         drawSettings(canvas);
         if (keyboard) drawKeyboard(canvas);
