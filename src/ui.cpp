@@ -110,8 +110,9 @@ bool coverMode = false;
 bool swallowTouch = false;
 bool speakerReady = false;
 
-// The wall mount is upside down relative to rotation 1, and that pose never changes, so the screen
-// has to start there. The resting pose keeps this rotation. Turning the tablet over selects the other one.
+// On a desk the tablet rests upside down relative to rotation 1, and that pose does not change by
+// itself, so the screen has to start there. The resting pose keeps this rotation. Turning it over
+// selects the other one.
 constexpr int HOME_ROT = 3;
 
 // True while a finger is down on the control, and for a short time after the tap, so a quick tap
