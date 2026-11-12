@@ -4,3 +4,4 @@
 __pycache__/
 *.log
 favlog*.txt
+web/firmware/*.bin
