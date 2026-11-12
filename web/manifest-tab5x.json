@@ -1,0 +1,17 @@
+{
+  "name": "M5Tab Sonos Controller (newer Tab5, experimental)",
+  "version": "0.0.0-dev",
+  "new_install_prompt_erase": true,
+  "new_install_improv_wait_time": 0,
+  "builds": [
+    {
+      "chipFamily": "ESP32-P4",
+      "parts": [
+        {
+          "path": "firmware/tab5x.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

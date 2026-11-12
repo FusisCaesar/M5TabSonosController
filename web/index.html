@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Install M5Tab Sonos Controller</title>
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"
+    ></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --text: #1c1917;
+        --muted: #57534e;
+        --line: #e7e5e4;
+        --bg: #fafaf9;
+        --card: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #fafaf9;
+          --muted: #a8a29e;
+          --line: #44403c;
+          --bg: #1c1917;
+          --card: #292524;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 17px/1.5 "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 38rem;
+        margin: 0 auto;
+        padding: 2.5rem 1.25rem 4rem;
+      }
+      h1 {
+        font-size: 1.7rem;
+        line-height: 1.25;
+        margin: 0 0 0.75rem;
+      }
+      p, li {
+        color: var(--text);
+      }
+      .lead, .note {
+        color: var(--muted);
+      }
+      .choices {
+        display: grid;
+        gap: 0.75rem;
+        margin: 1.5rem 0;
+      }
+      .choice {
+        border: 1px solid var(--line);
+        background: var(--card);
+        border-radius: 12px;
+        padding: 1rem 1rem 0.85rem;
+      }
+      .choice p {
+        margin: 0.35rem 0 0.75rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      a {
+        color: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Install M5Tab Sonos Controller</h1>
+      <p class="lead">
+        Use Chrome or Edge on a computer, and a USB-C cable that carries data.
+        Plug the Tab5 in, then press the button that matches it.
+      </p>
+
+      <div class="choices">
+        <div class="choice">
+          <esp-web-install-button manifest="manifest-tab5.json">
+            <button slot="activate">Tab5 (original, tested)</button>
+            <span slot="unsupported">Use Chrome or Edge on a computer.</span>
+          </esp-web-install-button>
+          <p>The earlier hardware, chip revision below 300. This is the build that has been used.</p>
+        </div>
+        <div class="choice">
+          <esp-web-install-button manifest="manifest-tab5x.json">
+            <button slot="activate">Tab5 newer revision (experimental)</button>
+            <span slot="unsupported">Use Chrome or Edge on a computer.</span>
+          </esp-web-install-button>
+          <p>Chip revision 300 and above. This build has not been run on hardware yet.</p>
+        </div>
+      </div>
+
+      <h2>If it does not start</h2>
+      <ul>
+        <li>If no port appears, hold the boot button while resetting the Tab5, then try again.</li>
+        <li>If the screen stays black after flashing, flash the other button. A wrong pick can be flashed over.</li>
+      </ul>
+      <p>
+        The page asks whether to erase the tablet. Erase on a first install.
+        Leave the data in place when you are updating and want to keep the saved Wi-Fi network and the Spotify sign-in.
+      </p>
+      <p class="note">
+        After it boots, join the Wi-Fi network named like <code>TabSonos...</code> and open the setup page.
+        The steps are in
+        <a href="https://github.com/FusisCaesar/M5TabSonosController#first-start">First start</a>.
+      </p>
+    </main>
+  </body>
+</html>

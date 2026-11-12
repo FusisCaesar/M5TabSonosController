@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      # platformio.ini pins a Windows core directory so the toolchain stays
+      # under the MAX_PATH limit. Linux CI uses the default ~/.platformio.
+      - name: Drop the Windows-only core directory
+        run: sed -i '/^core_dir[[:space:]]*=/d' platformio.ini
+
+      - name: Build both Tab5 variants
+        run: pio run -e tab5 -e tab5x
+
+      - name: Stage the factory images
+        run: |
+          mkdir -p web/firmware
+          cp .pio/build/tab5/firmware.factory.bin web/firmware/tab5.factory.bin
+          cp .pio/build/tab5x/firmware.factory.bin web/firmware/tab5x.factory.bin
+
+      - name: Stamp the manifest version
+        env:
+          FW_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["FW_VERSION"]
+          if os.environ["REF_TYPE"] == "tag":
+              version = version[1:] if version.startswith("v") else version
+          else:
+              version = "dev-" + version[:7]
+
+          for name in ("manifest-tab5.json", "manifest-tab5x.json"):
+              path = Path("web") / name
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          print(f"Stamped {version}")
+          PY
+
+      - name: Attach the images to the GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          body: |
+            Factory images for the browser installer.
+
+            - `tab5.factory.bin` is the original Tab5 (chip revision below 300), the tested build.
+            - `tab5x.factory.bin` is the newer Tab5 (chip revision 300 and above). It has not been run on hardware.
+          files: |
+            web/firmware/tab5.factory.bin
+            web/firmware/tab5x.factory.bin
+
+      - name: Upload the installer site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

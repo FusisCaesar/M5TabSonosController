@@ -20,13 +20,29 @@ A touch-screen Sonos remote for the [M5Stack Tab5](https://docs.m5stack.com/en/c
 
 ## What you need
 
-- An **M5Stack Tab5** (ESP32-P4, 1280x720 display). This project was proven on the earlier hardware revision (chip revision v1.3, board id `m5stack-tab5-p4`). A newer revision needs a different PlatformIO board. See [docs/tab5-control.md](docs/tab5-control.md).
+- An **M5Stack Tab5** (ESP32-P4, 1280x720 display). This project was proven on the earlier hardware revision (chip revision v1.3). The install page has a second button for a newer unit (chip revision 300 and above). That build has not been run on hardware yet. See [docs/tab5-control.md](docs/tab5-control.md).
 - A **Sonos** system on the same network. The firmware talks to the speakers' local control port, so the Tab5 must be on the same subnet. It was tested against a household of seven rooms running current Sonos software.
 - A **2.4 GHz Wi-Fi** network. The Tab5's radio does not use 5 GHz.
 - A computer with a USB-C cable, once, to flash it.
 - Optional, for Spotify: a Spotify account that is already linked in the Sonos app, and a free Spotify developer app (see below).
 
 ## Install
+
+### Flash from your browser
+
+Chrome or Edge on a computer, and a USB-C cable that carries data.
+
+1. Open the [install page](https://fusiscaesar.github.io/M5TabSonosController/).
+2. Plug the Tab5 into the computer.
+3. Press **Tab5 (original, tested)** for the earlier hardware, or **Tab5 newer revision (experimental)** for a unit with chip revision 300 or above. Choose the port when the browser asks.
+4. If no port appears, hold the boot button while resetting the Tab5, then try again.
+5. If the screen stays black, flash the other button. A wrong pick can be flashed over.
+
+The page asks whether to erase the tablet. Erase on a first install. Leave the data in place when you are updating and want to keep the saved Wi-Fi network and the Spotify sign-in.
+
+The same two images are in [M5Burner](https://docs.m5stack.com/en/download). Install the app, then search for **M5Tab Sonos Controller**. Pick the entry that matches the hardware revision.
+
+### Build it yourself
 
 1. Install [PlatformIO](https://platformio.org/install) (the CLI or the VS Code extension) and Python 3.
 2. Clone this repository.
@@ -38,6 +54,8 @@ A touch-screen Sonos remote for the [M5Stack Tab5](https://docs.m5stack.com/en/c
    ```
 
    If more than one serial port is present, add `--upload-port COMx` (Windows) or `--upload-port /dev/ttyACMx` (Linux/macOS).
+
+   For a newer Tab5 (chip revision 300 and above) use `-e tab5x` instead of `-e tab5`. That build has not been run on hardware yet.
 
 **Windows notes.** Set `PYTHONUTF8=1` first, or the upload fails after a successful build:
 

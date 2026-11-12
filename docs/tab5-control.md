@@ -4,7 +4,7 @@ Instructions for an agent bringing up a new firmware project on an M5Stack Tab5.
 
 Copy this file into the new repo as `AGENTS.md` or a Cursor rule, and copy the small platform files named at the end. Do not copy the rowing UI.
 
-The unit this was proven on is an ESP32-P4 revision v1.3 (pre-rev3), read by esptool as USB-Serial/JTAG, 16 MB flash, 400 MHz, 40 MHz crystal. A later P4 revision (chip revision 300 or above) is a different M5 board id (`board_M5Tab5X`) and needs the matching PlatformIO board, not `m5stack-tab5-p4`.
+The unit this was proven on is an ESP32-P4 revision v1.3 (pre-rev3), read by esptool as USB-Serial/JTAG, 16 MB flash, 400 MHz, 40 MHz crystal. A later P4 revision (chip revision 300 or above) is M5's Tab5X (`board_M5Tab5X`). Build it with `pio run -e tab5x`. That environment keeps the `m5stack-tab5-p4` board file and sets `board_build.chip_variant` to `esp32p4`, so it links the rev3 Arduino libraries. It has not been run on hardware. Do not switch the board to `esp32-p4-evboard`.
 
 ## Toolchain
 
@@ -27,6 +27,11 @@ monitor_filters = esp32_exception_decoder
 lib_deps =
     https://github.com/M5Stack/M5Unified.git#0.2.26
     https://github.com/M5Stack/M5GFX.git#0.2.33
+
+; Chip revision 300 and above. Not yet run on hardware.
+[env:tab5x]
+extends = env:tab5
+board_build.chip_variant = esp32p4
 ```
 
 Facts that took a failed flash to learn:
