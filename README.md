@@ -49,8 +49,6 @@ Chrome or Edge on a computer, and a USB-C cable that carries data.
 
 The page asks whether to erase the tablet. Erase on a first install. Leave the data in place when you are updating and want to keep the saved Wi-Fi network and the Spotify sign-in.
 
-The same two images are in [M5Burner](https://docs.m5stack.com/en/download). Install the app, then search for **M5Tab Sonos Controller**. Pick the entry that matches the hardware revision.
-
 ### Build it yourself
 
 1. Install [PlatformIO](https://platformio.org/install) (the CLI or the VS Code extension) and Python 3.
